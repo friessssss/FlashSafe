@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "FlashSafe desktop application shell"
 
+[lib]
+name = "flashsafe_app"
+path = "src/lib.rs"
+
 [[bin]]
 name = "flashsafe"
 path = "src/main.rs"
@@ -14,9 +18,16 @@ path = "src/main.rs"
 name = "flashsafe-capture-bench"
 path = "src/bin/capture_bench.rs"
 
+[[bin]]
+name = "flashsafe-pipeline-bench"
+path = "src/bin/pipeline_bench.rs"
+
 [dependencies]
 flashsafe-core = { path = "../flashsafe-core" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 anyhow = { workspace = true }
+tray-item = "0.10.0"
+windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
+windows-sys = "0.52.0"
