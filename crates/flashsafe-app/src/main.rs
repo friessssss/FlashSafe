@@ -11,9 +11,11 @@ use flashsafe_core::{
 };
 use std::sync::{mpsc, Arc, Mutex};
 use tracing::{info, warn};
-use tray_item::TrayItem;
+use tray_item::{IconSource, TrayItem};
 use windows::core::PCWSTR;
 use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_OK};
+use windows_sys::Win32::Foundation::HINSTANCE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{LoadIconW, IDI_APPLICATION};
 
 mod logging;
 
@@ -111,104 +113,208 @@ fn message_box_settings() -> Result<()> {
     Ok(())
 }
 
-fn tooltip_text(state: &AppState, profile: Profile) -> String {
+fn tooltip_text(enabled: TrayEnabled, profile: Profile) -> String {
     format!(
         "FlashSafe — {} ({})",
-        enabled_display(state.enabled),
+        enabled_display(enabled),
         profile_display(profile)
     )
 }
 
-fn build_tray(state: Arc<Mutex<AppState>>) -> Result<TrayItem> {
-    let profile = {
-        let st = state.lock().expect("state lock poisoned");
-        profile_from_config(&st.config)
-    };
+#[derive(Debug, Default, Clone, Copy)]
+struct MenuIds {
+    toggle: Option<u32>,
+    strict: Option<u32>,
+    balanced: Option<u32>,
+    minimal: Option<u32>,
+}
 
-    let mut tray = TrayItem::new("FlashSafe", tray_item::IconSource::Resource(""))?;
+fn refresh_tray(tray: &mut TrayItem, ids: &MenuIds, enabled: TrayEnabled, profile: Profile) {
+    // Tooltip.
+    let _ = tray
+        .inner_mut()
+        .set_tooltip(&tooltip_text(enabled, profile));
 
-    // Toggle item.
-    let enable_label = {
-        let st = state.lock().expect("state lock poisoned");
-        match st.enabled {
+    // Enable/disable menu label.
+    if let Some(id) = ids.toggle {
+        let label = match enabled {
             TrayEnabled::Enabled => "Disable FlashSafe".to_string(),
             TrayEnabled::Disabled => "Enable FlashSafe".to_string(),
-        }
-    };
-
-    tray.add_menu_item(&enable_label, {
-        let state = Arc::clone(&state);
-        let _tooltip = |st: &AppState| {
-            let p = profile_from_config(&st.config);
-            tooltip_text(st, p)
         };
-        move || {
-            let pipeline_update = {
-                let mut st = state.lock().expect("state lock poisoned");
-                st.enabled = match st.enabled {
-                    TrayEnabled::Enabled => TrayEnabled::Disabled,
-                    TrayEnabled::Disabled => TrayEnabled::Enabled,
-                };
-                // Push effective config: 0 mitigation when disabled.
-                let effective = if st.enabled == TrayEnabled::Disabled {
-                    FlashSafeConfig { mitigation_level: 0.0, ..st.config.clone() }
-                } else {
-                    st.config.clone()
-                };
-                st.pipeline_tx.as_ref().map(|tx| tx.send(PipelineCmd::UpdateConfig(effective)))
-            };
-            drop(pipeline_update); // result ignored — best-effort
+        let _ = tray.inner_mut().set_menu_item_label(&label, id);
+    }
 
-            // Note: tray-item 0.10 does not expose set_tooltip; tooltip update skipped.
-        }
-    })?;
-
-    // Profile selection: three separate items (acts like radio).
-    for p in [Profile::Strict, Profile::Balanced, Profile::Minimal] {
-        let label = format!(
+    let mk_profile_label = |p: Profile| -> String {
+        format!(
             "{}{}",
             profile_display(p),
             if p == profile { " (✓)" } else { "" }
-        );
-        tray.add_menu_item(&label, {
-            let state = Arc::clone(&state);
-            move || {
-                let pipeline_update = {
-                    let mut st = state.lock().expect("state lock poisoned");
-                    st.config = p.config();
-                    st.config.clamp();
-                    if let Err(e) = save_config(&st.config) {
-                        warn!("failed to save config after profile change: {e:?}");
-                    }
-                    if st.enabled == TrayEnabled::Enabled {
-                        st.pipeline_tx
-                            .as_ref()
-                            .map(|tx| tx.send(PipelineCmd::UpdateConfig(st.config.clone())))
-                    } else {
-                        None
-                    }
-                };
-                drop(pipeline_update);
+        )
+    };
 
-                // Note: tray-item 0.10 does not expose set_tooltip; tooltip update skipped.
+    if let Some(id) = ids.strict {
+        let _ = tray
+            .inner_mut()
+            .set_menu_item_label(&mk_profile_label(Profile::Strict), id);
+    }
+    if let Some(id) = ids.balanced {
+        let _ = tray
+            .inner_mut()
+            .set_menu_item_label(&mk_profile_label(Profile::Balanced), id);
+    }
+    if let Some(id) = ids.minimal {
+        let _ = tray
+            .inner_mut()
+            .set_menu_item_label(&mk_profile_label(Profile::Minimal), id);
+    }
+}
+
+fn build_tray(state: Arc<Mutex<AppState>>) -> Result<Arc<Mutex<TrayItem>>> {
+    let initial_snapshot = {
+        let st = state.lock().expect("state lock poisoned");
+        (st.enabled, st.config.clone())
+    };
+    let initial_profile = profile_from_config(&initial_snapshot.1);
+
+    let hicon = unsafe { LoadIconW(0 as HINSTANCE, IDI_APPLICATION) };
+    let icon = if hicon != 0 {
+        IconSource::RawIcon(hicon)
+    } else {
+        IconSource::Resource("IDI_APPLICATION")
+    };
+
+    let tray = TrayItem::new("FlashSafe", icon)?;
+    let tray_arc = Arc::new(Mutex::new(tray));
+    let menu_ids = Arc::new(Mutex::new(MenuIds::default()));
+
+    // Add menu items on the tray thread.
+    {
+        let mut tray = tray_arc.lock().expect("tray mutex poisoned");
+        let inner = tray.inner_mut();
+
+        // Toggle item.
+        let toggle_label = match initial_snapshot.0 {
+            TrayEnabled::Enabled => "Disable FlashSafe",
+            TrayEnabled::Disabled => "Enable FlashSafe",
+        };
+        let toggle_id = inner.add_menu_item_with_id(toggle_label, {
+            let state = Arc::clone(&state);
+            let tray_arc = Arc::clone(&tray_arc);
+            let menu_ids = Arc::clone(&menu_ids);
+
+            move || {
+                let (enabled, config) = {
+                    let mut st = state.lock().expect("state lock poisoned");
+                    st.enabled = match st.enabled {
+                        TrayEnabled::Enabled => TrayEnabled::Disabled,
+                        TrayEnabled::Disabled => TrayEnabled::Enabled,
+                    };
+                    let effective = if st.enabled == TrayEnabled::Disabled {
+                        FlashSafeConfig {
+                            mitigation_level: 0.0,
+                            ..st.config.clone()
+                        }
+                    } else {
+                        st.config.clone()
+                    };
+                    st.pipeline_tx
+                        .as_ref()
+                        .map(|tx| tx.send(PipelineCmd::UpdateConfig(effective)));
+                    (st.enabled, st.config.clone())
+                };
+
+                let profile = profile_from_config(&config);
+                let ids = *menu_ids.lock().expect("menu ids mutex poisoned");
+                if let Ok(mut tray) = tray_arc.lock() {
+                    refresh_tray(&mut tray, &ids, enabled, profile);
+                }
             }
         })?;
+
+        // Profile header.
+        inner.add_separator()?;
+        inner.add_label("Profile")?;
+
+        // Profile "radio" items.
+        let mut ids_guard = menu_ids.lock().expect("menu ids mutex poisoned");
+        for p in [Profile::Strict, Profile::Balanced, Profile::Minimal] {
+            let label = mk_profile_label(p, initial_profile);
+            let id = inner.add_menu_item_with_id(&label, {
+                let state = Arc::clone(&state);
+                let tray_arc = Arc::clone(&tray_arc);
+                let menu_ids = Arc::clone(&menu_ids);
+                move || {
+                    let (enabled, config) = {
+                        let mut st = state.lock().expect("state lock poisoned");
+                        st.config = p.config();
+                        st.config.clamp();
+                        if let Err(e) = save_config(&st.config) {
+                            warn!("failed to save config after profile change: {e:?}");
+                        }
+                        let effective = if st.enabled == TrayEnabled::Disabled {
+                            FlashSafeConfig {
+                                mitigation_level: 0.0,
+                                ..st.config.clone()
+                            }
+                        } else {
+                            st.config.clone()
+                        };
+                        st.pipeline_tx
+                            .as_ref()
+                            .map(|tx| tx.send(PipelineCmd::UpdateConfig(effective)));
+                        (st.enabled, st.config.clone())
+                    };
+
+                    let profile = profile_from_config(&config);
+                    let ids = *menu_ids.lock().expect("menu ids mutex poisoned");
+                    if let Ok(mut tray) = tray_arc.lock() {
+                        refresh_tray(&mut tray, &ids, enabled, profile);
+                    }
+                }
+            })?;
+
+            match p {
+                Profile::Strict => ids_guard.strict = Some(id),
+                Profile::Balanced => ids_guard.balanced = Some(id),
+                Profile::Minimal => ids_guard.minimal = Some(id),
+            }
+        }
+
+        ids_guard.toggle = Some(toggle_id);
+
+        // Final separator + settings and quit.
+        inner.add_separator()?;
+        inner.add_menu_item_with_id("Open Settings", {
+            move || {
+                if let Err(e) = message_box_settings() {
+                    warn!("failed to open settings dialog: {e:?}");
+                }
+            }
+        })?;
+        inner.add_menu_item_with_id("Quit", {
+            move || {
+                info!("FlashSafe quitting (tray menu)");
+                std::process::exit(0);
+            }
+        })?;
+
+        refresh_tray(
+            &mut tray,
+            &*menu_ids.lock().expect("menu ids mutex poisoned"),
+            initial_snapshot.0,
+            initial_profile,
+        );
     }
 
-    // "Open Settings" placeholder: info dialog.
-    tray.add_menu_item("Open Settings", move || {
-        if let Err(e) = message_box_settings() {
-            warn!("failed to open settings dialog: {e:?}");
-        }
-    })?;
+    Ok(tray_arc)
+}
 
-    // Quit.
-    tray.add_menu_item("Quit", move || {
-        info!("FlashSafe quitting (tray menu)");
-        std::process::exit(0);
-    })?;
-
-    Ok(tray)
+fn mk_profile_label(p: Profile, selected: Profile) -> String {
+    format!(
+        "{}{}",
+        profile_display(p),
+        if p == selected { " (✓)" } else { "" }
+    )
 }
 
 fn main() -> Result<()> {
