@@ -1,5 +1,7 @@
 # FlashSafe
 
+[![CI](https://github.com/flashsafe/flashsafe/actions/workflows/ci.yml/badge.svg)](https://github.com/flashsafe/flashsafe/actions/workflows/ci.yml)
+
 A real-time desktop accessibility tool that detects and mitigates harmful flashing visual stimuli during gameplay or video playback.
 
 > **Disclaimer:** FlashSafe is an accessibility aid, not a medical device. It does not certify content as medically safe.
