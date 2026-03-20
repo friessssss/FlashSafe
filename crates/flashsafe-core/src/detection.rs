@@ -225,7 +225,8 @@ impl LuminanceDetector {
             return None;
         }
 
-        let flashes = count_flash_transitions(&self.samples, self.config.change_threshold);
+        let values: Vec<f32> = self.samples.iter().map(|s| s.luminance).collect();
+        let flashes = count_flash_transitions(&values, self.config.change_threshold);
         let window_secs = self.config.window.as_secs_f32();
         let flashes_per_second = flashes as f32 / window_secs;
 
@@ -281,13 +282,16 @@ fn srgb_to_linear(c: f64) -> f64 {
     }
 }
 
-/// Count the number of opposing-direction luminance transitions (flash pairs)
-/// in `samples` using the WCAG direction-change algorithm.
-fn count_flash_transitions(samples: &[LuminanceSample], threshold: f32) -> u32 {
+/// Count opposing-direction transitions (flash pairs) in a sequence of scalar
+/// values using the WCAG direction-change algorithm.
+///
+/// A "flash" is counted each time the direction of change reverses sign
+/// (positive↔negative) with magnitude > `threshold`.
+fn count_flash_transitions(values: &[f32], threshold: f32) -> u32 {
     let mut flashes = 0u32;
     let mut last_dir: i8 = 0;
-    for w in samples.windows(2) {
-        let delta = w[1].luminance - w[0].luminance;
+    for w in values.windows(2) {
+        let delta = w[1] - w[0];
         let dir: i8 = if delta > threshold {
             1
         } else if delta < -threshold {
@@ -303,6 +307,236 @@ fn count_flash_transitions(samples: &[LuminanceSample], threshold: f32) -> u32 {
         }
     }
     flashes
+}
+
+// ---------------------------------------------------------------------------
+// RedFlashDetector — WCAG 2.1 red flash detector
+// ---------------------------------------------------------------------------
+
+/// Configuration for [`RedFlashDetector`].
+#[derive(Debug, Clone)]
+pub struct RedFlashDetectorConfig {
+    /// Duration of the sliding analysis window (must be ≥ 200 ms).
+    pub window: Duration,
+    /// Minimum change in mean red ratio (0–1) to count as a red transition.
+    pub change_threshold: f32,
+    /// Flash rate (flashes/sec) at or above which a [`FlashEvent`] is emitted.
+    pub max_flashes_per_second: f32,
+}
+
+impl Default for RedFlashDetectorConfig {
+    fn default() -> Self {
+        Self {
+            window: Duration::from_millis(1000),
+            // 0.2 requires a meaningful shift in red dominance to count.
+            change_threshold: 0.2,
+            max_flashes_per_second: 3.0,
+        }
+    }
+}
+
+struct RedSample {
+    red_ratio: f32,
+    timestamp: Instant,
+}
+
+/// Stateful red flash detector.
+///
+/// Per frame, computes the mean *red ratio* = R / (R + G + B) across all
+/// pixels, then applies the same WCAG direction-change algorithm as
+/// [`LuminanceDetector`] to detect opposing red-dominance transitions at >3 Hz.
+///
+/// Feed frames via [`RedFlashDetector::push_bgra`] or
+/// [`RedFlashDetector::push_sample`] (pre-computed ratio, for testing).
+pub struct RedFlashDetector {
+    config: RedFlashDetectorConfig,
+    samples: Vec<RedSample>,
+}
+
+impl RedFlashDetector {
+    pub fn new(config: RedFlashDetectorConfig) -> Self {
+        Self {
+            config,
+            samples: Vec::new(),
+        }
+    }
+
+    /// Compute the mean red ratio from a BGRA frame and push it.
+    ///
+    /// Red ratio per pixel = R / (R + G + B + ε), averaged over all pixels.
+    /// Returns `Some(FlashEvent)` when the red flash threshold is reached.
+    pub fn push_bgra(
+        &mut self,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        timestamp: Instant,
+    ) -> Option<FlashEvent> {
+        let ratio = bgra_mean_red_ratio(data, width, height);
+        self.push_sample(ratio, timestamp)
+    }
+
+    /// Push a pre-computed red ratio directly (for unit tests and benchmarks).
+    pub fn push_sample(&mut self, red_ratio: f32, timestamp: Instant) -> Option<FlashEvent> {
+        let cutoff = timestamp
+            .checked_sub(self.config.window)
+            .unwrap_or(timestamp);
+        self.samples.retain(|s| s.timestamp >= cutoff);
+        self.samples.push(RedSample { red_ratio, timestamp });
+
+        if self.samples.len() < 2 {
+            return None;
+        }
+
+        let values: Vec<f32> = self.samples.iter().map(|s| s.red_ratio).collect();
+        let flashes = count_flash_transitions(&values, self.config.change_threshold);
+        let window_secs = self.config.window.as_secs_f32();
+        let flashes_per_second = flashes as f32 / window_secs;
+
+        if flashes_per_second >= self.config.max_flashes_per_second {
+            Some(FlashEvent {
+                kind: FlashKind::Red,
+                severity: flashes_per_second,
+                timestamp,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Reset the detector state.
+    pub fn reset(&mut self) {
+        self.samples.clear();
+    }
+}
+
+/// Compute mean red ratio = R / (R + G + B + ε) over all BGRA pixels.
+///
+/// Uses raw 8-bit channel values (no sRGB linearisation needed; the ratio is
+/// perceptual, not radiometric).  ε = 1e-6 prevents division by zero on pure
+/// black pixels.
+fn bgra_mean_red_ratio(data: &[u8], width: u32, height: u32) -> f32 {
+    let pixel_count = (width * height) as usize;
+    debug_assert_eq!(
+        data.len(),
+        pixel_count * 4,
+        "BGRA data length mismatch: expected {} bytes for {}×{}",
+        pixel_count * 4,
+        width,
+        height
+    );
+    if pixel_count == 0 {
+        return 0.0;
+    }
+    let sum: f64 = data.chunks_exact(4).map(|px| {
+        let b = px[0] as f64;
+        let g = px[1] as f64;
+        let r = px[2] as f64;
+        r / (r + g + b + 1e-6)
+    }).sum();
+    (sum / pixel_count as f64) as f32
+}
+
+#[cfg(test)]
+mod red_flash_detector_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Build (red_ratio, timestamp) pairs for a square wave of red_ratio values.
+    fn red_ratio_wave(
+        high: f32,
+        low: f32,
+        freq_hz: f32,
+        duration_secs: f32,
+        fps: f32,
+    ) -> Vec<(f32, Instant)> {
+        let base = Instant::now();
+        let n_frames = (duration_secs * fps).round() as usize;
+        (0..n_frames)
+            .map(|i| {
+                let t = i as f32 / fps;
+                let phase = (t * freq_hz).fract();
+                let ratio = if phase < 0.5 { high } else { low };
+                (ratio, base + Duration::from_secs_f32(t))
+            })
+            .collect()
+    }
+
+    fn run_red_detector(frames: Vec<(f32, Instant)>) -> bool {
+        let mut det = RedFlashDetector::new(RedFlashDetectorConfig::default());
+        let mut detected = false;
+        for (ratio, ts) in frames {
+            if det.push_sample(ratio, ts).is_some() {
+                detected = true;
+                break;
+            }
+        }
+        detected
+    }
+
+    #[test]
+    fn test_saturated_red_3hz_triggers() {
+        // Red ratio swings 1.0 → 0.0 at 3 Hz — should trigger
+        let frames = red_ratio_wave(1.0, 0.0, 3.0, 1.0, 60.0);
+        assert!(
+            run_red_detector(frames),
+            "saturated red at 3 Hz should trigger red flash detection"
+        );
+    }
+
+    #[test]
+    fn test_blue_3hz_no_trigger() {
+        // Pure blue pixels alternating with black: red_ratio stays near 0.
+        // We simulate by feeding red_ratio ≈ 0 throughout.
+        let frames = red_ratio_wave(0.001, 0.0, 3.0, 1.0, 60.0);
+        assert!(
+            !run_red_detector(frames),
+            "blue/black alternation should not trigger red flash detection"
+        );
+    }
+
+    #[test]
+    fn test_pink_3hz_triggers() {
+        // Pink pixels (R=255, G=150, B=150) alternating with black at 3 Hz.
+        // Pink red_ratio ≈ 0.46, black ≈ 0.0 — swing of 0.46 > threshold 0.2.
+        let frames = red_ratio_wave(0.46, 0.0, 3.0, 1.0, 60.0);
+        assert!(
+            run_red_detector(frames),
+            "pink/black alternation at 3 Hz should trigger red flash detection"
+        );
+    }
+
+    #[test]
+    fn test_push_bgra_pure_red_ratio() {
+        // Pure red pixel: BGRA = [0, 0, 255, 255] → red_ratio = 1.0
+        let red_pixel: [u8; 4] = [0, 0, 255, 255];
+        let ratio = super::bgra_mean_red_ratio(&red_pixel, 1, 1);
+        assert!(
+            (ratio - 1.0).abs() < 1e-3,
+            "pure red pixel should have red_ratio ≈ 1.0, got {ratio}"
+        );
+
+        // Pure blue pixel: BGRA = [255, 0, 0, 255] → red_ratio ≈ 0
+        let blue_pixel: [u8; 4] = [255, 0, 0, 255];
+        let ratio = super::bgra_mean_red_ratio(&blue_pixel, 1, 1);
+        assert!(
+            ratio < 1e-3,
+            "pure blue pixel should have red_ratio ≈ 0.0, got {ratio}"
+        );
+    }
+
+    #[test]
+    fn test_red_detector_reset() {
+        let base = Instant::now();
+        let mut det = RedFlashDetector::new(RedFlashDetectorConfig::default());
+        // Build up state with 5 Hz high-amplitude red wave
+        for (ratio, ts) in red_ratio_wave(1.0, 0.0, 5.0, 0.5, 60.0) {
+            det.push_sample(ratio, ts);
+        }
+        det.reset();
+        let result = det.push_sample(0.5, base + Duration::from_secs(1));
+        assert!(result.is_none(), "detector should be clear after reset");
+    }
 }
 
 #[cfg(test)]
