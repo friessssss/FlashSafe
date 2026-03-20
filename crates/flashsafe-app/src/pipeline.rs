@@ -14,6 +14,7 @@ use flashsafe_core::{
     gamma::GammaDimmer,
     mitigation::MitigationFilter,
 };
+use crate::monitor_resolve::resolve_capture_config;
 use std::{
     collections::VecDeque,
     sync::mpsc,
@@ -118,30 +119,37 @@ impl Drop for PipelineHandle {
 
 /// Spawn the capture→detect→mitigate pipeline on a background thread.
 ///
+/// The DXGI output (monitor) is derived automatically from `initial_cfg`:
+/// when `monitor_all_screens` is `true` or `target_process_name` is `None`
+/// the primary monitor is used; otherwise the monitor hosting the named
+/// window is resolved via [`resolve_capture_config`].
+///
 /// # Arguments
-/// * `capture_cfg` – DXGI capture config (adapter/monitor selection).
-/// * `initial_cfg` – Initial [`FlashSafeConfig`] (sensitivity + mitigation).
+/// * `initial_cfg` – Initial [`FlashSafeConfig`] (sensitivity, mitigation,
+///                   and target process selection).
 /// * `timing_tx`   – Optional channel to receive per-frame [`FrameTiming`]
-///                    measurements (used by benchmarks; `None` in production).
+///                   measurements (used by benchmarks; `None` in production).
 ///
 /// Returns a [`PipelineHandle`] plus shared [`PipelineStats`].
 pub fn spawn(
-    capture_cfg: CaptureConfig,
     initial_cfg: FlashSafeConfig,
     timing_tx: Option<mpsc::SyncSender<FrameTiming>>,
 ) -> Result<(PipelineHandle, Arc<RwLock<PipelineStats>>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<PipelineCmd>();
     let stats = Arc::new(RwLock::new(PipelineStats::default()));
 
-    // Validate that we can create a Capturer before spawning the thread.
-    let mut capturer = Capturer::new(capture_cfg)?;
+    // Resolve which monitor to capture and validate the Capturer before
+    // spawning the thread.
+    let capture_cfg = resolve_capture_config(&initial_cfg);
+    let capturer = Capturer::new(capture_cfg.clone())?;
     let stats_for_thread = Arc::clone(&stats);
 
     let handle = thread::Builder::new()
         .name("flashsafe-pipeline".into())
         .spawn(move || {
             run_loop(
-                &mut capturer,
+                capturer,
+                capture_cfg,
                 initial_cfg,
                 cmd_rx,
                 timing_tx,
@@ -163,7 +171,8 @@ pub fn spawn(
 // ---------------------------------------------------------------------------
 
 fn run_loop(
-    capturer: &mut Capturer,
+    mut capturer: Capturer,
+    mut capture_cfg: CaptureConfig,
     mut cfg: FlashSafeConfig,
     cmd_rx: mpsc::Receiver<PipelineCmd>,
     timing_tx: Option<mpsc::SyncSender<FrameTiming>>,
@@ -194,6 +203,32 @@ fn run_loop(
                         MitigationFilter::new(Duration::from_millis(new_cfg.ramp_ms as u64));
                     // Restore display immediately when disabled (mitigation_level == 0).
                     dimmer.set_level(0.0);
+
+                    // Re-resolve the capture target monitor when the process
+                    // selection or "monitor all screens" flag changes.
+                    let new_capture_cfg = resolve_capture_config(&new_cfg);
+                    if new_capture_cfg.output_index != capture_cfg.output_index
+                        || new_capture_cfg.adapter_index != capture_cfg.adapter_index
+                    {
+                        match Capturer::new(new_capture_cfg.clone()) {
+                            Ok(new_cap) => {
+                                capturer = new_cap;
+                                capture_cfg = new_capture_cfg;
+                                info!(
+                                    output_index = capture_cfg.output_index,
+                                    "capturer recreated for new monitor target"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "failed to recreate capturer for new monitor — \
+                                     keeping existing output"
+                                );
+                            }
+                        }
+                    }
+
                     cfg = new_cfg;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,

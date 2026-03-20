@@ -29,5 +29,6 @@ tracing-subscriber = { workspace = true }
 tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 tray-item = "0.10.0"
-windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging"] }
+eframe = "0.27"
+windows = { workspace = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
 windows-sys = "0.52.0"

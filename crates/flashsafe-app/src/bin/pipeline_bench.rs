@@ -12,7 +12,7 @@
 //!       * ≥ 60 fps sustained
 
 use anyhow::Result;
-use flashsafe_core::{capture::CaptureConfig, config::FlashSafeConfig};
+use flashsafe_core::config::FlashSafeConfig;
 use flashsafe_app::pipeline;
 use std::{
     sync::mpsc,
@@ -34,11 +34,7 @@ fn main() -> Result<()> {
 
     println!("Starting E2E pipeline benchmark for {} s …", run_duration.as_secs());
 
-    let handle = pipeline::spawn(
-        CaptureConfig::default(),
-        FlashSafeConfig::default(),
-        Some(timing_tx),
-    )?;
+    let (handle, _stats) = pipeline::spawn(FlashSafeConfig::default(), Some(timing_tx))?;
 
     // Collect timings for the run duration.
     let bench_start = Instant::now();
