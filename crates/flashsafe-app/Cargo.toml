@@ -1,0 +1,17 @@
+[package]
+name = "flashsafe-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "FlashSafe desktop application shell"
+
+[[bin]]
+name = "flashsafe"
+path = "src/main.rs"
+
+[dependencies]
+flashsafe-core = { path = "../flashsafe-core" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
