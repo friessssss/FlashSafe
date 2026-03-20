@@ -23,6 +23,10 @@ thiserror = "2"
 # Log file rotation
 tracing-appender = "0.2"
 
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
 # Windows system APIs (used on Windows targets only)
 windows = { version = "0.58", features = [
     "Win32_Foundation",

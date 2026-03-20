@@ -5,6 +5,7 @@
 //! be tested independently.
 
 pub mod capture;
+pub mod config;
 pub mod detection;
 pub mod mitigation;
 
