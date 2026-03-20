@@ -11,4 +11,7 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+
 [dev-dependencies]

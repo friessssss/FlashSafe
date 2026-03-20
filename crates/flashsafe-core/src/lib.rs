@@ -1,8 +1,10 @@
-//! flashsafe-core: flash detection and mitigation logic.
+//! flashsafe-core: flash detection, mitigation, and screen-capture logic.
 //!
-//! This crate contains all detection and mitigation algorithms.
-//! It has no UI dependencies and can be tested independently.
+//! This crate contains all detection and mitigation algorithms and the
+//! low-level screen-capture harness.  It has no UI dependencies and can
+//! be tested independently.
 
+pub mod capture;
 pub mod detection;
 pub mod mitigation;
 
