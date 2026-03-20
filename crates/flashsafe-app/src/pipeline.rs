@@ -11,10 +11,13 @@ use flashsafe_core::{
     detection::{
         LuminanceDetector, LuminanceDetectorConfig, RedFlashDetector, RedFlashDetectorConfig,
     },
+    gamma::GammaDimmer,
     mitigation::MitigationFilter,
 };
 use std::{
+    collections::VecDeque,
     sync::mpsc,
+    sync::{Arc, RwLock},
     thread,
     time::{Duration, Instant},
 };
@@ -29,6 +32,43 @@ pub struct FrameTiming {
     pub total: Duration,
     /// Whether a flash event (luminance or red) was detected this frame.
     pub flash_detected: bool,
+}
+
+/// Shared pipeline stats for tray/UI status surfaces.
+#[derive(Debug, Clone)]
+pub struct PipelineStats {
+    pub frames_processed: u64,
+    pub flash_events_total: u64,
+    pub mitigation_activations: u64,
+    pub last_flash_at: Option<Instant>,
+    pub current_mitigation_level: f32,
+    pub session_start: Instant,
+    /// Rolling 60-second flash event timestamps.
+    pub recent_flash_times: VecDeque<Instant>,
+}
+
+impl Default for PipelineStats {
+    fn default() -> Self {
+        Self {
+            frames_processed: 0,
+            flash_events_total: 0,
+            mitigation_activations: 0,
+            last_flash_at: None,
+            current_mitigation_level: 0.0,
+            session_start: Instant::now(),
+            recent_flash_times: VecDeque::new(),
+        }
+    }
+}
+
+impl PipelineStats {
+    pub fn flashes_per_minute(&self) -> u32 {
+        let now = Instant::now();
+        self.recent_flash_times
+            .iter()
+            .filter(|&&t| now.duration_since(t) <= Duration::from_secs(60))
+            .count() as u32
+    }
 }
 
 /// Message sent to the pipeline thread to request a config update or shutdown.
@@ -84,16 +124,18 @@ impl Drop for PipelineHandle {
 /// * `timing_tx`   – Optional channel to receive per-frame [`FrameTiming`]
 ///                    measurements (used by benchmarks; `None` in production).
 ///
-/// Returns a [`PipelineHandle`] that can push config updates and request shutdown.
+/// Returns a [`PipelineHandle`] plus shared [`PipelineStats`].
 pub fn spawn(
     capture_cfg: CaptureConfig,
     initial_cfg: FlashSafeConfig,
     timing_tx: Option<mpsc::SyncSender<FrameTiming>>,
-) -> Result<PipelineHandle> {
+) -> Result<(PipelineHandle, Arc<RwLock<PipelineStats>>)> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<PipelineCmd>();
+    let stats = Arc::new(RwLock::new(PipelineStats::default()));
 
     // Validate that we can create a Capturer before spawning the thread.
     let mut capturer = Capturer::new(capture_cfg)?;
+    let stats_for_thread = Arc::clone(&stats);
 
     let handle = thread::Builder::new()
         .name("flashsafe-pipeline".into())
@@ -103,13 +145,17 @@ pub fn spawn(
                 initial_cfg,
                 cmd_rx,
                 timing_tx,
+                stats_for_thread,
             );
         })?;
 
-    Ok(PipelineHandle {
-        sender: cmd_tx,
-        thread: Some(handle),
-    })
+    Ok((
+        PipelineHandle {
+            sender: cmd_tx,
+            thread: Some(handle),
+        },
+        stats,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -121,10 +167,14 @@ fn run_loop(
     mut cfg: FlashSafeConfig,
     cmd_rx: mpsc::Receiver<PipelineCmd>,
     timing_tx: Option<mpsc::SyncSender<FrameTiming>>,
+    stats: Arc<RwLock<PipelineStats>>,
 ) {
     let mut lum_det = build_lum_detector(&cfg);
     let mut red_det = build_red_detector(&cfg);
     let mut mit_filter = MitigationFilter::new(Duration::from_millis(cfg.ramp_ms as u64));
+    // GammaDimmer owns the hardware gamma ramp (or overlay fallback) for this
+    // pipeline session.  Dropping it at end-of-loop restores the original ramp.
+    let dimmer = GammaDimmer::new();
 
     let mut frame_count = 0u64;
 
@@ -142,6 +192,8 @@ fn run_loop(
                     red_det = build_red_detector(&new_cfg);
                     mit_filter =
                         MitigationFilter::new(Duration::from_millis(new_cfg.ramp_ms as u64));
+                    // Restore display immediately when disabled (mitigation_level == 0).
+                    dimmer.set_level(0.0);
                     cfg = new_cfg;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -166,7 +218,7 @@ fn run_loop(
         let ts = t_capture; // use capture start as frame timestamp
         let w = raw_frame.width;
         let h = raw_frame.height;
-        let mut data = raw_frame.data;
+        let data = raw_frame.data;
 
         // --- Detect ---
         let lum_event = lum_det.push_bgra(&data, w, h, ts);
@@ -188,8 +240,11 @@ fn run_loop(
         }
 
         // --- Mitigate ---
+        // Advance the smooth-ramp state without touching the (read-only) pixel
+        // buffer; apply the resulting level to the hardware gamma ramp instead.
         let target_level = if flash_detected { cfg.mitigation_level } else { 0.0 };
-        mit_filter.apply(&mut data, target_level, ts);
+        mit_filter.tick(target_level, ts);
+        dimmer.set_level(mit_filter.level());
 
         let total = t_capture.elapsed();
         frame_count += 1;
@@ -200,6 +255,30 @@ fn run_loop(
             latency_us = total.as_micros(),
             "frame processed"
         );
+
+        if let Ok(mut st) = stats.write() {
+            st.frames_processed = frame_count;
+            st.current_mitigation_level = target_level;
+
+            if flash_detected {
+                st.flash_events_total += 1;
+                st.last_flash_at = Some(ts);
+                st.recent_flash_times.push_back(ts);
+            }
+
+            if target_level > 0.0 {
+                st.mitigation_activations += 1;
+            }
+
+            let cutoff = ts.checked_sub(Duration::from_secs(60)).unwrap_or(ts);
+            while let Some(&front) = st.recent_flash_times.front() {
+                if front < cutoff {
+                    st.recent_flash_times.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
 
         // --- Emit timing (benchmarks only) ---
         if let Some(ref tx) = timing_tx {

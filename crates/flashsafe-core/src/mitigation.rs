@@ -125,6 +125,17 @@ impl MitigationFilter {
         }
     }
 
+    /// Advance the ramp toward `target_level` without modifying any pixel buffer.
+    ///
+    /// Use this when mitigation is applied via `GammaDimmer::set_level` rather
+    /// than in-place pixel writes.  After calling `tick`, read the result with
+    /// [`level`][Self::level] and pass it to the dimmer.
+    pub fn tick(&mut self, target_level: f32, timestamp: Instant) {
+        let target = target_level.clamp(0.0, 1.0);
+        self.advance_ramp(target, timestamp);
+        self.last_update = Some(timestamp);
+    }
+
     /// The effective mitigation level used for the most-recent frame.
     pub fn level(&self) -> f32 {
         self.current_level

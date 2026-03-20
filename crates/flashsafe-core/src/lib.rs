@@ -7,6 +7,7 @@
 pub mod capture;
 pub mod config;
 pub mod detection;
+pub mod gamma;
 pub mod mitigation;
 
 /// A single captured frame of luminance data ready for analysis.
