@@ -1,16 +1,19 @@
-//! Hardware gamma-ramp dimming with a `WS_EX_LAYERED` overlay fallback.
+//! Hardware gamma-ramp dimming with fallback chain.
 //!
-//! [`GammaDimmer`] adjusts the display's hardware gamma curve via
-//! `SetDeviceGammaRamp`.  When that call fails (HDR displays, virtual
-//! monitors, restricted driver permissions), it transparently falls back to
-//! a fullscreen `WS_EX_LAYERED` overlay window that composites a
-//! semi-transparent black layer over the desktop.
+//! [`GammaDimmer`] tries three strategies in order:
+//!
+//! 1. **`SetDeviceGammaRamp`** (legacy GDI) — works on most non-HDR displays.
+//! 2. **`IDXGIOutput::SetGammaControl`** (DXGI) — alternative for displays/drivers
+//!    where the GDI path is blocked; effective when a full-screen swap chain is
+//!    active on the output.
+//! 3. **`WS_EX_LAYERED` overlay** — always composites over the desktop; covers
+//!    full-screen apps running under DXGI Flip Model (the default since Win10).
 //!
 //! The original gamma ramp (or overlay visibility) is restored automatically
 //! when `GammaDimmer` is dropped.
 
 /// Dims the display by adjusting the hardware gamma ramp, with an automatic
-/// fallback to a fullscreen layered-overlay window.
+/// fallback chain to a fullscreen layered-overlay window.
 ///
 /// # Usage
 /// ```ignore
@@ -69,13 +72,18 @@ mod windows_impl {
     use tracing::{info, warn};
 
     use windows::Win32::Foundation::{COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory, IDXGIFactory, IDXGIOutput};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_GAMMA_CONTROL, DXGI_RGB};
     use windows::Win32::Graphics::Gdi::HBRUSH;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetSystemMetrics,
-        PeekMessageW, RegisterClassExW, SetLayeredWindowAttributes, ShowWindow, TranslateMessage,
-        LWA_ALPHA, MSG, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN, SW_HIDE, SW_SHOWNOACTIVATE,
-        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        HWND_TOPMOST, PeekMessageW, RegisterClassExW, SetLayeredWindowAttributes,
+        SetWindowPos, ShowWindow, TranslateMessage,
+        LWA_ALPHA, MSG, PM_REMOVE, SM_CXSCREEN, SM_CYSCREEN,
+        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE,
+        WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        WS_POPUP,
     };
     use windows::core::PCWSTR;
 
@@ -164,7 +172,7 @@ mod windows_impl {
                 let ok = GetDeviceGammaRamp(hdc, saved.as_mut_ptr().cast());
                 if ok == 0 {
                     warn!(
-                        "GammaDimmer: GetDeviceGammaRamp failed — trying overlay fallback"
+                        "GammaDimmer: GetDeviceGammaRamp failed — trying DXGI fallback"
                     );
                     ReleaseDC(core::ptr::null_mut(), hdc);
                     return None;
@@ -193,7 +201,120 @@ mod windows_impl {
     }
 
     // -----------------------------------------------------------------------
+    // Secondary strategy: IDXGIOutput::SetGammaControl
+    //
+    // This alternative is available on some display drivers where the legacy
+    // GDI path (`SetDeviceGammaRamp`) is blocked (e.g. certain HDR configs or
+    // restricted driver permissions).  Note that `SetGammaControl` is fully
+    // effective only when a full-screen exclusive swap chain owns the output;
+    // in windowed/Flip-Model scenarios the call may succeed but have no visible
+    // effect — in which case we fall through to the overlay.
+    // -----------------------------------------------------------------------
+
+    struct DxgiGammaDimmer {
+        output: IDXGIOutput,
+        /// Saved state retrieved via GetGammaControl, or synthesised identity.
+        saved: Box<DXGI_GAMMA_CONTROL>,
+    }
+
+    impl DxgiGammaDimmer {
+        fn try_new() -> Option<Self> {
+            unsafe {
+                // Enumerate the primary adapter and its first output.
+                let factory: IDXGIFactory = CreateDXGIFactory().ok()?;
+                let adapter = factory.EnumAdapters(0).ok()?;
+                let output: IDXGIOutput = adapter.EnumOutputs(0).ok()?;
+
+                // Allocate the gamma control struct on the heap to avoid a
+                // ~12 KB stack frame (DXGI_GAMMA_CONTROL.GammaCurve = [DXGI_RGB; 1025]).
+                let mut saved: Box<DXGI_GAMMA_CONTROL> =
+                    Box::new(mem::zeroed());
+
+                // Try to read the current gamma state.  This often fails outside
+                // full-screen exclusive mode, so synthesise an identity curve if so.
+                if output.GetGammaControl(saved.as_mut() as *mut _).is_err() {
+                    saved.Scale = DXGI_RGB {
+                        Red: 1.0,
+                        Green: 1.0,
+                        Blue: 1.0,
+                    };
+                    saved.Offset = DXGI_RGB {
+                        Red: 0.0,
+                        Green: 0.0,
+                        Blue: 0.0,
+                    };
+                    for (i, entry) in saved.GammaCurve.iter_mut().enumerate() {
+                        let v = i as f32 / 1024.0;
+                        *entry = DXGI_RGB {
+                            Red: v,
+                            Green: v,
+                            Blue: v,
+                        };
+                    }
+                }
+
+                // Probe: attempt a no-op SetGammaControl with the saved values.
+                // If the driver refuses (e.g. not in FSE mode), bail out so the
+                // overlay fallback is used instead.
+                if output
+                    .SetGammaControl(saved.as_ref() as *const _)
+                    .is_err()
+                {
+                    warn!(
+                        "GammaDimmer: IDXGIOutput::SetGammaControl unavailable — \
+                         falling back to overlay"
+                    );
+                    return None;
+                }
+
+                info!("GammaDimmer: using IDXGIOutput::SetGammaControl (secondary)");
+                Some(DxgiGammaDimmer { output, saved })
+            }
+        }
+
+        fn set_level(&self, level: f32) {
+            let dim_factor = 1.0_f32 - level.clamp(0.0, 1.0);
+            // Build a modified control block: keep the original curve but scale
+            // down the output via the Scale field.
+            let ctrl = DXGI_GAMMA_CONTROL {
+                Scale: DXGI_RGB {
+                    Red: self.saved.Scale.Red * dim_factor,
+                    Green: self.saved.Scale.Green * dim_factor,
+                    Blue: self.saved.Scale.Blue * dim_factor,
+                },
+                Offset: self.saved.Offset,
+                GammaCurve: self.saved.GammaCurve,
+            };
+            unsafe {
+                let _ = self.output.SetGammaControl(&ctrl as *const _);
+            }
+        }
+    }
+
+    impl Drop for DxgiGammaDimmer {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = self
+                    .output
+                    .SetGammaControl(self.saved.as_ref() as *const _);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Fallback strategy: WS_EX_LAYERED fullscreen overlay
+    //
+    // Window flags:
+    //   WS_EX_TOPMOST    — always above normal windows
+    //   WS_EX_LAYERED    — per-pixel / per-window alpha compositing
+    //   WS_EX_TRANSPARENT — mouse clicks pass through to the window below
+    //   WS_EX_NOACTIVATE — never steal focus or appear in the taskbar
+    //
+    // After every ShowWindow call we also invoke SetWindowPos(HWND_TOPMOST)
+    // to reinforce topmost status.  This is necessary because some DWM
+    // transitions can silently demote a topmost window; the explicit
+    // SetWindowPos call forces Windows to re-evaluate the z-order and
+    // brings the overlay back above DXGI Flip-Model swap chains.
     // -----------------------------------------------------------------------
 
     struct OverlayDimmer {
@@ -269,8 +390,10 @@ mod windows_impl {
             let screen_w = GetSystemMetrics(SM_CXSCREEN);
             let screen_h = GetSystemMetrics(SM_CYSCREEN);
 
+            // WS_EX_NOACTIVATE prevents the overlay from stealing focus or
+            // appearing in the taskbar / Alt-Tab switcher.
             let hwnd = match CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT,
+                WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE,
                 PCWSTR(class_name.as_ptr()),
                 PCWSTR::null(),
                 WS_POPUP,
@@ -310,6 +433,15 @@ mod windows_impl {
                         let _ = ShowWindow(hwnd, SW_HIDE);
                     } else {
                         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                        // Reinforce topmost z-order after showing.  DWM can silently
+                        // demote topmost windows during mode transitions; this call
+                        // re-asserts the position above DXGI Flip-Model swap chains.
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_TOPMOST,
+                            0, 0, 0, 0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                        );
                     }
                 }
 
@@ -334,20 +466,25 @@ mod windows_impl {
 
     pub(super) enum Inner {
         Gamma(#[allow(private_interfaces)] GammaDimmerInner),
+        DxgiGamma(#[allow(private_interfaces)] DxgiGammaDimmer),
         Overlay(#[allow(private_interfaces)] OverlayDimmer),
     }
 
     impl Inner {
         pub(super) fn new() -> Self {
-            match GammaDimmerInner::try_new() {
-                Some(g) => Inner::Gamma(g),
-                None => Inner::Overlay(OverlayDimmer::new()),
+            if let Some(g) = GammaDimmerInner::try_new() {
+                return Inner::Gamma(g);
             }
+            if let Some(d) = DxgiGammaDimmer::try_new() {
+                return Inner::DxgiGamma(d);
+            }
+            Inner::Overlay(OverlayDimmer::new())
         }
 
         pub(super) fn set_level(&self, level: f32) {
             match self {
                 Inner::Gamma(g) => g.set_level(level),
+                Inner::DxgiGamma(d) => d.set_level(level),
                 Inner::Overlay(o) => o.set_level(level),
             }
         }
