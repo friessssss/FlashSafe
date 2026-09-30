@@ -3,12 +3,18 @@
 ## Status
 - **Phase 0 — done:** CI restored, real icons, generated schemas ignored, file logging, shell plugin dropped, CSP set, README rewritten.
 - **Phase 1 — done** except the `flashsafe-sim` PNG-sequence tool: WCAG judge, per-pixel filter with area budgets, presets and config migration. 33 tests.
-- **Interim engine:** the existing mirror runs the new filter.
+- **Engine:**
   - The GPU does the per-pixel work: a stats pass, then a mip-chain area average, then an apply pass that keeps a display history.
   - The CPU runs the tile and region budget on a 160×90 readback.
-  - Only the target's **client area** is captured and covered (crop via `DWMWA_EXTENDED_FRAME_BOUNDS`), and the frame pool is recreated when the window is resized. These pieces were pulled forward from Phases 2 and 3.
-  - It still uses the old HWND mirror window, so **mouse and focus pass-through is not fixed until Phase 2.**
-- **Phases 2–6:** not started. They need a Windows machine to validate.
+  - Only the target's **client area** is captured and covered (crop via `DWMWA_EXTENDED_FRAME_BOUNDS`), and the frame pool is recreated when the window is resized.
+- **Phase 2 — implemented, awaiting Windows validation** (`src-tauri/src/win/overlay.rs`):
+  - Click-through overlay: `WS_EX_NOREDIRECTIONBITMAP | LAYERED | TRANSPARENT | TOPMOST | NOACTIVATE | TOOLWINDOW`, presented through a DirectComposition swapchain (`FLIP_SEQUENTIAL`, frame-latency waitable, max latency 1).
+  - Never activates. Topmost while the game (or a window it owns) is in front; otherwise sits directly above the game in z-order. Hidden while the game is minimized. Excluded from screen capture.
+  - Placement is polled every engine tick (cheap Win32 calls; `SetWindowPos` only on change) instead of WinEvent hooks.
+  - The session stops, with a message, if the game window closes or the engine hits an error, rather than leaving a frozen picture over the game.
+  - The harness is now an input test target (clicks, wheel, keys, raw mouse, XInput, crosshair, strobe keys).
+  - Not done: exclusive-fullscreen and HDR detection and warnings (Phase 4).
+- **Phases 3–6:** not started.
 
 ## Context
 

@@ -1,9 +1,7 @@
-//! WGC → client-area crop → per-pixel stats → [`TileFilter`] scales → per-pixel filter shader → mirror `HWND`.
+//! WGC → client-area crop → per-pixel stats → [`TileFilter`] scales → per-pixel filter shader → [`Overlay`].
 //!
-//! Interim engine: the per-tile budget runs on the CPU from a small readback
-//! (per-pixel work is on the GPU), and the mirror still uses an HWND swapchain. See `docs/mvp-plan.md` (Phases 2–3)
-//! for the click-through DirectComposition overlay and GPU filter that
-//! replace this.
+//! The per-tile budget runs on the CPU from a small readback; all per-pixel
+//! work is on the GPU. The click-through window lives in `overlay.rs`.
 
 use std::ffi::c_void;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
@@ -11,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use super::overlay::Overlay;
 use flashsafe_core::{
     tile_stats_f32x4, FlashSafeConfig, TileFilter, TileStats, TILE_COLS, TILE_ROWS,
 };
@@ -23,7 +22,7 @@ use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::UI::WindowId;
-use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCompile, D3DCOMPILE_OPTIMIZATION_LEVEL3};
 use windows::Win32::Graphics::Direct3D::{
@@ -45,22 +44,15 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R32G32B32A32_FLOAT,
     DXGI_FORMAT_R32G32_FLOAT, DXGI_SAMPLE_DESC,
 };
-use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-    DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-};
+use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows, GetClientRect,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, PeekMessageW, PostQuitMessage, RegisterClassExW, SetWindowPos, ShowWindow,
-    TranslateMessage, HTTRANSPARENT, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_SHOWNA,
-    HWND_TOPMOST, WM_DESTROY, WM_NCCREATE, WM_NCHITTEST, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_TOPMOST, WS_POPUP,
+    DispatchMessageW, EnumWindows, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PeekMessageW, TranslateMessage,
+    MSG, PM_REMOVE, WM_DESTROY,
 };
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -184,7 +176,7 @@ fn engine_main(rx: Receiver<EngineCommand>, stats: Arc<RwLock<EngineStats>>) -> 
             Err(RecvTimeoutError::Timeout) => {}
         }
 
-        if let Some(ref mut sess) = session {
+        if let Some(sess) = session.as_mut() {
             match sess.tick() {
                 Ok(presented) => {
                     let sum = sess.filter.summary();
@@ -203,12 +195,15 @@ fn engine_main(rx: Receiver<EngineCommand>, stats: Arc<RwLock<EngineStats>>) -> 
                     }
                 }
                 Err(e) => {
+                    // Stop rather than leave a frozen picture over the game.
                     let msg = format!("{e:#}");
+                    tracing::error!("protection stopped: {msg}");
                     let mut s = stats.write();
-                    if s.last_error.as_deref() != Some(msg.as_str()) {
-                        tracing::error!("engine tick failed: {msg}");
-                    }
-                    s.last_error = Some(msg);
+                    *s = EngineStats {
+                        last_error: Some(format!("Protection stopped: {msg}")),
+                        ..EngineStats::default()
+                    };
+                    session = None;
                 }
             }
         }
@@ -327,100 +322,10 @@ fn compile_shaders(device: &ID3D11Device, src: &str) -> Result<Shaders> {
     })
 }
 
-static MIRROR_CLASS: &[u16] = &[
-    b'F' as u16, b'l' as u16, b'a' as u16, b's' as u16, b'h' as u16, b'S' as u16, b'a' as u16,
-    b'f' as u16, b'e' as u16, b'M' as u16, 0,
-];
-
-unsafe extern "system" fn mirror_wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_NCCREATE => LRESULT(1),
-        // Pass mouse hits to the game below (more reliable with D3D flip swapchains than WS_EX_TRANSPARENT).
-        WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
-        WM_DESTROY => {
-            PostQuitMessage(0);
-            LRESULT(0)
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
-    }
-}
-
-fn create_mirror_window(w: i32, h: i32) -> Result<HWND> {
-    unsafe {
-        let hmod = GetModuleHandleW(None).unwrap_or_default();
-        let hinst = HINSTANCE(hmod.0);
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: windows::Win32::UI::WindowsAndMessaging::CS_HREDRAW
-                | windows::Win32::UI::WindowsAndMessaging::CS_VREDRAW,
-            lpfnWndProc: Some(mirror_wnd_proc),
-            hInstance: hinst,
-            lpszClassName: windows::core::PCWSTR(MIRROR_CLASS.as_ptr()),
-            ..Default::default()
-        };
-        let _ = RegisterClassExW(&wc);
-        // Click-through via WM_NCHITTEST → HTTRANSPARENT (see mirror_wnd_proc).
-        let hwnd = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-            windows::core::PCWSTR(MIRROR_CLASS.as_ptr()),
-            windows::core::PCWSTR::null(),
-            WS_POPUP,
-            200,
-            200,
-            w,
-            h,
-            None,
-            None,
-            Some(hinst),
-            None,
-        )?;
-        let _ = ShowWindow(hwnd, SW_SHOWNA);
-        Ok(hwnd)
-    }
-}
-
-fn create_swapchain(
-    device: &ID3D11Device,
-    hwnd: HWND,
-    w: u32,
-    h: u32,
-) -> Result<(IDXGISwapChain1, ID3D11RenderTargetView)> {
-    let dxgi: IDXGIDevice = device.cast().unwrap();
-    let adapter = unsafe { dxgi.GetAdapter().ok().context("adapter")? };
-    let factory: IDXGIFactory2 = unsafe { adapter.GetParent().context("factory")? };
-    let desc = DXGI_SWAP_CHAIN_DESC1 {
-        Width: w,
-        Height: h,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-        Stereo: false.into(),
-        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
-        BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
-        BufferCount: 2,
-        Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
-        AlphaMode: windows::Win32::Graphics::Dxgi::Common::DXGI_ALPHA_MODE_IGNORE,
-        Flags: 0,
-    };
-    let sc = unsafe { factory.CreateSwapChainForHwnd(device, hwnd, &desc, None, None)? };
-    let back: ID3D11Texture2D = unsafe { sc.GetBuffer(0)? };
-    let mut rtv = None;
-    unsafe {
-        device.CreateRenderTargetView(&back, None, Some(&mut rtv))?;
-    }
-    Ok((sc, rtv.context("rtv")?))
-}
-
-/// Where the target's client area is: on screen, and inside the captured
-/// texture. WGC captures the window's visible frame (DWM extended frame
+/// Where the target's client area is inside the captured texture. WGC captures the window's visible frame (DWM extended frame
 /// bounds, title bar included); we only filter and cover the client area, so
 /// the real title bar and borders stay visible and clickable.
 struct ClientArea {
-    screen: RECT,
     /// Crop box inside the captured texture.
     left: u32,
     top: u32,
@@ -452,36 +357,11 @@ fn client_area(target: HWND, content_w: u32, content_h: u32) -> Option<ClientAre
             return None;
         }
         Some(ClientArea {
-            screen: RECT {
-                left: origin.x,
-                top: origin.y,
-                right: origin.x + width as i32,
-                bottom: origin.y + height as i32,
-            },
             left,
             top,
             width,
             height,
         })
-    }
-}
-
-/// Only `SetWindowPos` when the client area moves/resizes — avoids redundant DWM work every frame.
-fn sync_mirror_if_moved(mirror: HWND, r: RECT, last: &mut Option<RECT>) {
-    if last.as_ref() == Some(&r) {
-        return;
-    }
-    *last = Some(r);
-    unsafe {
-        let _ = SetWindowPos(
-            mirror,
-            Some(HWND_TOPMOST),
-            r.left,
-            r.top,
-            r.right - r.left,
-            r.bottom - r.top,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
     }
 }
 
@@ -588,12 +468,9 @@ struct ShaderParams {
 
 struct ActiveSession {
     target_hwnd: HWND,
-    mirror_hwnd: HWND,
+    overlay: Overlay,
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
-    swap: IDXGISwapChain1,
-    swap_rtv: Option<ID3D11RenderTargetView>,
-    swap_size: (u32, u32),
     shaders: Shaders,
     samp: ID3D11SamplerState,
     rs: ID3D11RasterizerState,
@@ -602,7 +479,6 @@ struct ActiveSession {
     det_staging: ID3D11Texture2D,
     scale_tex: ID3D11Texture2D,
     scale_srv: ID3D11ShaderResourceView,
-    last_client_rect: Option<RECT>,
     _pool_cell: Arc<Mutex<Option<Direct3D11CaptureFramePool>>>,
     pool: Direct3D11CaptureFramePool,
     pool_size: SizeInt32,
@@ -664,9 +540,7 @@ impl ActiveSession {
         let _ = session.SetIsBorderRequired(false);
         session.StartCapture().context("StartCapture")?;
 
-        let mirror_hwnd = create_mirror_window(size.Width, size.Height)?;
-        let swap_size = (size.Width.max(1) as u32, size.Height.max(1) as u32);
-        let (swap, swap_rtv) = create_swapchain(&device, mirror_hwnd, swap_size.0, swap_size.1)?;
+        let overlay = Overlay::new(&device, size.Width.max(1) as u32, size.Height.max(1) as u32)?;
         let shaders = compile_shaders(&device, include_str!("../shader.hlsl"))?;
 
         let det = Target::new(&device, DETECTION_W, DETECTION_H, DXGI_FORMAT_R32G32B32A32_FLOAT, false)?;
@@ -739,12 +613,9 @@ impl ActiveSession {
         let filter = TileFilter::new(config.filter);
         Ok(Self {
             target_hwnd,
-            mirror_hwnd,
+            overlay,
             device,
             ctx,
-            swap,
-            swap_rtv: Some(swap_rtv),
-            swap_size,
             shaders,
             samp,
             rs,
@@ -753,7 +624,6 @@ impl ActiveSession {
             det_staging,
             scale_tex,
             scale_srv,
-            last_client_rect: None,
             _pool_cell: pool_cell,
             pool,
             pool_size: size,
@@ -790,8 +660,19 @@ impl ActiveSession {
         unsafe { access.GetInterface::<ID3D11Texture2D>() }.context("GetInterface")
     }
 
-    /// Returns whether a frame was presented.
+    /// Returns whether a frame was presented. An error ends the session.
     fn tick(&mut self) -> Result<bool> {
+        if !unsafe { IsWindow(Some(self.target_hwnd)).as_bool() } {
+            anyhow::bail!("The game window was closed.");
+        }
+        let presented = self.capture_and_present();
+        // Every tick, even without a new frame: the game may have moved,
+        // been minimized, or lost focus.
+        self.overlay.follow(self.target_hwnd);
+        presented
+    }
+
+    fn capture_and_present(&mut self) -> Result<bool> {
         let dt = if let Some(frame) = self.newest_frame() {
             let content = frame.ContentSize().context("ContentSize")?;
             let copied = {
@@ -859,7 +740,6 @@ impl ActiveSession {
             back: 1,
         };
         unsafe { self.ctx.CopySubresourceRegion(&surf.frame, 0, 0, 0, 0, src, 0, Some(&bx)) };
-        sync_mirror_if_moved(self.mirror_hwnd, area.screen, &mut self.last_client_rect);
         Ok(true)
     }
 
@@ -941,12 +821,14 @@ impl ActiveSession {
             );
         }
 
-        // Apply: filtered colour to the mirror, and the same colour into the
+        // Apply: filtered colour to the overlay, and the same colour into the
         // next history texture.
-        if self.swap_size != (w, h) {
-            self.resize_swapchain(w, h)?;
-        }
-        let swap_rtv = self.swap_rtv.clone().context("swapchain RTV")?;
+        let ctx = self.ctx.clone();
+        let flush = || unsafe {
+            ctx.OMSetRenderTargets(Some(&[]), None);
+            ctx.Flush();
+        };
+        let swap_rtv = self.overlay.begin_frame(&self.device, flush, w, h)?;
         let next = 1 - surf.cur;
         self.draw(
             &[Some(swap_rtv), Some(surf.hist[next].rtv.clone())],
@@ -956,30 +838,8 @@ impl ActiveSession {
             h,
         );
         surf.cur = next;
-        unsafe {
-            // Interval 0 = do not block on vsync (mirror only; lowers latency vs blocking Present).
-            let _ = self.swap.Present(0, DXGI_PRESENT(0));
-        }
+        self.overlay.present();
         self.last_present = Instant::now();
-        Ok(())
-    }
-
-    fn resize_swapchain(&mut self, w: u32, h: u32) -> Result<()> {
-        unsafe {
-            self.ctx.OMSetRenderTargets(Some(&[]), None);
-            // Every reference to the back buffer must be released before ResizeBuffers.
-            self.swap_rtv = None;
-            self.ctx.Flush();
-            self.swap
-                .ResizeBuffers(0, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, Default::default())
-                .context("ResizeBuffers")?;
-            let back: ID3D11Texture2D = self.swap.GetBuffer(0)?;
-            let mut rtv = None;
-            self.device.CreateRenderTargetView(&back, None, Some(&mut rtv))?;
-            self.swap_rtv = Some(rtv.context("rtv")?);
-        }
-        self.swap_size = (w, h);
-        self.last_client_rect = None;
         Ok(())
     }
 
@@ -1017,14 +877,6 @@ impl ActiveSession {
             // Unbind so the next pass can use these textures the other way round.
             self.ctx.OMSetRenderTargets(Some(&[]), None);
             self.ctx.PSSetShaderResources(0, Some(&unbind));
-        }
-    }
-}
-
-impl Drop for ActiveSession {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DestroyWindow(self.mirror_hwnd);
         }
     }
 }

@@ -6,7 +6,7 @@ It's meant for single-player and casual co-op games. It uses compositor capture 
 
 > **Not a medical device.** FlashSafe reduces flashing but cannot guarantee every flash is caught. If you feel unwell, stop playing.
 
-**Status:** pre-MVP. The flash filter is done and tested. The overlay window is still the old one, so **mouse clicks and focus may not pass through to the game yet**. See [docs/mvp-plan.md](docs/mvp-plan.md) for the audit, the design and the roadmap.
+**Status:** pre-MVP. The flash filter is done and tested, and the filtered picture is drawn in a click-through overlay that never takes focus, so mouse, keyboard and controllers keep going to the game. See [docs/mvp-plan.md](docs/mvp-plan.md) for the audit, the design and the roadmap.
 
 ## How the filter works
 
@@ -36,11 +36,13 @@ npm run tauri build -- --no-bundle   # release build → target/release/flashsaf
 cargo test -p flashsafe-core         # filter + WCAG test suite (any OS)
 ```
 
-A test window that flashes, for checking capture without a game:
+A test window for checking FlashSafe without a game:
 
 ```powershell
 cargo run -p flashsafe --bin flashsafe-harness
 ```
+
+It flashes on demand (keys `0` slow toggle, `1`–`5` strobe at 3–20 Hz, `D` dark, `W` white) and shows every input it receives: clicks, wheel, keys, raw mouse deltas and XInput controller state. With protection on, all of them should keep counting, and its red crosshair should sit exactly under the real cursor.
 
 ### Working from Linux or macOS
 The filter crate builds and tests anywhere. The Windows app can be type-checked without a Windows machine:

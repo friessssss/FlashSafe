@@ -1,3 +1,4 @@
-//! Windows-only capture, D3D11 present, and mirror window.
+//! Windows-only capture, GPU filtering and the click-through overlay.
 
 pub mod engine;
+mod overlay;
