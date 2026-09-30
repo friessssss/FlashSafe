@@ -68,7 +68,7 @@ pub fn tile_stats_f32x4(
             let mut acc = [0.0f32; 4];
             for y in y0..y1 {
                 let row = &data[y * row_stride + x0 * 4..y * row_stride + x1 * 4];
-                for px in row.chunks_exact(4) {
+                for px in row.as_chunks::<4>().0 {
                     for (a, v) in acc.iter_mut().zip(px) {
                         *a += v;
                     }

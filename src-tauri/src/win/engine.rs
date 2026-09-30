@@ -924,9 +924,8 @@ impl ActiveSession {
         self.filter.update(&self.stats, dt);
         if self.config.enabled {
             let (rise, fall) = (self.filter.rise_scales(), self.filter.fall_scales());
-            for (i, pair) in self.scales.chunks_exact_mut(2).enumerate() {
-                pair[0] = rise[i];
-                pair[1] = fall[i];
+            for ((pair, r), f) in self.scales.as_chunks_mut::<2>().0.iter_mut().zip(rise).zip(fall) {
+                *pair = [*r, *f];
             }
         } else {
             self.scales.fill(1.0);
