@@ -1,187 +1,153 @@
-//! Runtime configuration and built-in sensitivity profiles for FlashSafe.
-//!
-//! [`FlashSafeConfig`] is serialised to / deserialised from TOML and stored at
-//! `%APPDATA%\FlashSafe\config.toml` on Windows.  Missing keys fall back to
-//! serde defaults, so upgrading the app never causes a parse failure.
-
-use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
-/// Top-level runtime configuration.
-///
-/// All fields have serde `default` annotations so that a partial or empty
-/// `config.toml` is valid: missing keys are filled from [`FlashSafeConfig::default`].
+fn default_sensitivity_preset() -> String {
+    "medium".into()
+}
+
+/// Low / medium / high pipeline bundles for the sensitivity UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(rename_all = "camelCase")]
+pub struct SensitivityPresets {
+    pub low: PipelineSettings,
+    pub medium: PipelineSettings,
+    pub high: PipelineSettings,
+}
+
+/// Returns clamped preset pipelines (single source of truth for UI + saved config).
+pub fn sensitivity_presets() -> SensitivityPresets {
+    let mut low = PipelineSettings {
+        grid_size: 12,
+        spike_delta_threshold: 0.20,
+        peak_clip_cell_fraction: 0.50,
+        pattern_sensitivity: 0.22,
+        max_mitigation: 0.55,
+        attack_ms: 22.0,
+        release_ms: 130.0,
+        temporal_blend: 0.2,
+        highlight_knee: 0.86,
+        exposure_scale: 0.52,
+        desaturate_on_threat: 0.18,
+    };
+    let mut medium = PipelineSettings::default();
+    let mut high = PipelineSettings {
+        grid_size: 20,
+        spike_delta_threshold: 0.055,
+        peak_clip_cell_fraction: 0.18,
+        pattern_sensitivity: 0.72,
+        max_mitigation: 0.98,
+        attack_ms: 5.0,
+        release_ms: 320.0,
+        temporal_blend: 0.38,
+        highlight_knee: 0.68,
+        exposure_scale: 0.26,
+        desaturate_on_threat: 0.52,
+    };
+    low.clamp();
+    medium.clamp();
+    high.clamp();
+    SensitivityPresets {
+        low,
+        medium,
+        high,
+    }
+}
+
+/// Serializable settings mirrored in the UI and engine thread.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 pub struct FlashSafeConfig {
-    /// Minimum luminance change (0–1, linear) to count as a general-flash transition.
-    pub luminance_threshold: f32,
-    /// Minimum red-ratio change (0–1) to count as a red-flash transition.
-    pub red_threshold: f32,
-    /// Flash rate (Hz) at or above which mitigation is triggered.
-    pub flash_rate_hz: f32,
-    /// Mitigation strength: 0.0 = passthrough, 1.0 = full black.
-    pub mitigation_level: f32,
-    /// Fade-in / fade-out ramp duration in milliseconds (0 = instant).
-    pub ramp_ms: u32,
+    pub enabled: bool,
+    /// Last selected target window (HWND as u64). 0 = none.
+    pub target_hwnd: u64,
+    /// Human-readable title for display only.
+    pub target_title: String,
+    pub monitor_all_screens: bool,
+    /// Extra compositor delay (ms) before presenting mirror — tiny safety margin.
+    pub present_delay_ms: u32,
+    /// UI preset last chosen: `low` | `medium` | `high` | `custom`.
+    #[serde(default = "default_sensitivity_preset")]
+    pub sensitivity_preset: String,
+    pub pipeline: PipelineSettings,
 }
 
 impl Default for FlashSafeConfig {
-    /// Balanced profile defaults.
     fn default() -> Self {
-        Profile::Balanced.config()
+        Self {
+            // When false, detection still runs but GPU dimming stays off (preview / troubleshooting).
+            enabled: true,
+            target_hwnd: 0,
+            target_title: String::new(),
+            monitor_all_screens: false,
+            present_delay_ms: 0,
+            sensitivity_preset: default_sensitivity_preset(),
+            pipeline: PipelineSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PipelineSettings {
+    /// Rows/columns for downsampled grid stats (e.g. 16 → 256 cells).
+    pub grid_size: u32,
+    /// Minimum mean luminance jump (linear 0–1) in one frame to count toward spike.
+    pub spike_delta_threshold: f32,
+    /// Fraction of downsample cells near white (≥0.95 luma) to flag peak clip.
+    pub peak_clip_cell_fraction: f32,
+    /// Weight for band-pass (3–30 Hz) energy in combined threat score [0,1].
+    pub pattern_sensitivity: f32,
+    /// Max mitigation blend factor when threat = 1.
+    pub max_mitigation: f32,
+    /// Attack time constant (ms) — how fast mitigation ramps up.
+    pub attack_ms: f32,
+    /// Release time constant (ms) — how fast mitigation decays.
+    pub release_ms: f32,
+    /// Temporal blend with previous mitigated frame (0 = off, 1 = heavy).
+    pub temporal_blend: f32,
+    /// Highlight knee: compress linear values above this toward 1.0.
+    pub highlight_knee: f32,
+    /// Optional global exposure scale when mitigating (multiplier on linear RGB).
+    pub exposure_scale: f32,
+    pub desaturate_on_threat: f32,
+}
+
+impl Default for PipelineSettings {
+    fn default() -> Self {
+        Self {
+            grid_size: 16,
+            spike_delta_threshold: 0.12,
+            peak_clip_cell_fraction: 0.35,
+            pattern_sensitivity: 0.4,
+            max_mitigation: 0.9,
+            attack_ms: 8.0,
+            release_ms: 200.0,
+            temporal_blend: 0.28,
+            highlight_knee: 0.74,
+            exposure_scale: 0.34,
+            desaturate_on_threat: 0.38,
+        }
     }
 }
 
 impl FlashSafeConfig {
-    /// Validate ranges and clamp any out-of-range values in place.
     pub fn clamp(&mut self) {
-        self.luminance_threshold = self.luminance_threshold.clamp(0.0, 1.0);
-        self.red_threshold = self.red_threshold.clamp(0.0, 1.0);
-        self.flash_rate_hz = self.flash_rate_hz.max(0.1);
-        self.mitigation_level = self.mitigation_level.clamp(0.0, 1.0);
+        self.present_delay_ms = self.present_delay_ms.min(50);
+        self.pipeline.clamp();
     }
 }
 
-/// Named sensitivity presets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Profile {
-    /// WCAG-compliant thresholds, 80 % dimming.  Best for photosensitive users.
-    Strict,
-    /// Slightly relaxed thresholds, 60 % dimming.  Recommended for most users.
-    Balanced,
-    /// High thresholds, 40 % dimming.  Catches only severe events.
-    Minimal,
-}
-
-impl Profile {
-    /// Return the [`FlashSafeConfig`] for this preset.
-    pub fn config(self) -> FlashSafeConfig {
-        match self {
-            Profile::Strict => FlashSafeConfig {
-                luminance_threshold: 0.1,
-                red_threshold: 0.2,
-                flash_rate_hz: 3.0,
-                mitigation_level: 0.8,
-                ramp_ms: 50,
-            },
-            Profile::Balanced => FlashSafeConfig {
-                luminance_threshold: 0.15,
-                red_threshold: 0.25,
-                flash_rate_hz: 3.0,
-                mitigation_level: 0.6,
-                ramp_ms: 50,
-            },
-            Profile::Minimal => FlashSafeConfig {
-                luminance_threshold: 0.25,
-                red_threshold: 0.35,
-                flash_rate_hz: 3.5,
-                mitigation_level: 0.4,
-                ramp_ms: 30,
-            },
-        }
-    }
-}
-
-/// Return the platform config directory: `%APPDATA%\FlashSafe` on Windows,
-/// `~/.config/FlashSafe` elsewhere.
-pub fn config_dir() -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let base = std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        base.join("FlashSafe")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let base = std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."));
-        base.join(".config").join("FlashSafe")
-    }
-}
-
-/// Load config from `%APPDATA%\FlashSafe\config.toml`.
-///
-/// Returns `Ok(default)` if the file does not exist.  Parse errors are
-/// propagated so callers can warn the user.
-pub fn load() -> Result<FlashSafeConfig> {
-    let path = config_dir().join("config.toml");
-    if !path.exists() {
-        return Ok(FlashSafeConfig::default());
-    }
-    let raw = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading config from {}", path.display()))?;
-    let mut cfg: FlashSafeConfig = toml::from_str(&raw)
-        .with_context(|| format!("parsing config from {}", path.display()))?;
-    cfg.clamp();
-    Ok(cfg)
-}
-
-/// Persist `config` to `%APPDATA%\FlashSafe\config.toml`, creating the
-/// directory if needed.
-pub fn save(config: &FlashSafeConfig) -> Result<()> {
-    let dir = config_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating config dir {}", dir.display()))?;
-    let path = dir.join("config.toml");
-    let toml_str = toml::to_string_pretty(config).context("serialising config to TOML")?;
-    std::fs::write(&path, toml_str)
-        .with_context(|| format!("writing config to {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_default_is_balanced() {
-        let cfg = FlashSafeConfig::default();
-        let balanced = Profile::Balanced.config();
-        assert_eq!(cfg, balanced);
-    }
-
-    #[test]
-    fn test_round_trip_toml() {
-        let original = Profile::Strict.config();
-        let serialised = toml::to_string_pretty(&original).unwrap();
-        let deserialised: FlashSafeConfig = toml::from_str(&serialised).unwrap();
-        assert_eq!(original, deserialised, "round-trip must be lossless");
-    }
-
-    #[test]
-    fn test_partial_toml_uses_defaults() {
-        // Only override one field — all others must fall back to defaults.
-        let partial = r#"mitigation_level = 0.9"#;
-        let cfg: FlashSafeConfig = toml::from_str(partial).unwrap();
-        let expected_default = FlashSafeConfig::default();
-        assert_eq!(
-            cfg.luminance_threshold, expected_default.luminance_threshold,
-            "missing keys must use defaults"
-        );
-        assert!(
-            (cfg.mitigation_level - 0.9).abs() < 1e-5,
-            "explicit key must be honoured"
-        );
-    }
-
-    #[test]
-    fn test_all_profiles_valid() {
-        for profile in [Profile::Strict, Profile::Balanced, Profile::Minimal] {
-            let mut cfg = profile.config();
-            cfg.clamp();
-            // After clamping nothing should have changed (values are already in range)
-            assert_eq!(cfg, profile.config(), "{profile:?} values must already be in range");
-        }
-    }
-
-    #[test]
-    fn test_empty_toml_uses_defaults() {
-        let cfg: FlashSafeConfig = toml::from_str("").unwrap();
-        assert_eq!(cfg, FlashSafeConfig::default(), "empty TOML must yield defaults");
+impl PipelineSettings {
+    pub fn clamp(&mut self) {
+        self.grid_size = self.grid_size.clamp(4, 64);
+        self.spike_delta_threshold = self.spike_delta_threshold.clamp(0.02, 0.5);
+        self.peak_clip_cell_fraction = self.peak_clip_cell_fraction.clamp(0.05, 1.0);
+        self.pattern_sensitivity = self.pattern_sensitivity.clamp(0.0, 1.0);
+        self.max_mitigation = self.max_mitigation.clamp(0.0, 1.0);
+        self.attack_ms = self.attack_ms.clamp(1.0, 500.0);
+        self.release_ms = self.release_ms.clamp(10.0, 2000.0);
+        self.temporal_blend = self.temporal_blend.clamp(0.0, 0.95);
+        self.highlight_knee = self.highlight_knee.clamp(0.5, 0.99);
+        self.exposure_scale = self.exposure_scale.clamp(0.2, 1.0);
+        self.desaturate_on_threat = self.desaturate_on_threat.clamp(0.0, 1.0);
     }
 }

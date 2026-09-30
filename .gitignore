@@ -1,22 +1,8 @@
-# Rust build artifacts
-/target/
-**/*.rs.bk
-
-# Cargo lock is committed for binaries, not libraries
-# Cargo.lock  # keep for workspace binary
-
-# Editor / IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+/target
+**/target
+dist
+node_modules
 .DS_Store
-Thumbs.db
-
-# Env / secrets
-.env
-*.pem
-*.key
-
-# Log files
 *.log
+.env
+.env.*
