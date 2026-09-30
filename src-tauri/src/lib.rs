@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tauri::Manager;
 
+mod logging;
 #[cfg(windows)]
 mod win;
 
@@ -23,12 +24,14 @@ pub struct WindowRow {
 
 #[cfg(not(windows))]
 #[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EngineStats {
     pub running: bool,
     pub frames: u64,
     pub fps: f32,
     pub flashes: u64,
     pub mitigation: f32,
+    pub hold: f32,
     pub last_error: Option<String>,
 }
 
@@ -63,11 +66,15 @@ fn list_windows() -> Vec<WindowRow> {
 
 #[tauri::command]
 fn load_config() -> FlashSafeConfig {
-    config::load_json().unwrap_or_default()
+    config::load_json().unwrap_or_else(|e| {
+        tracing::warn!("loading settings failed, using defaults: {e:#}");
+        FlashSafeConfig::default()
+    })
 }
 
 #[tauri::command]
-fn save_config(cfg: FlashSafeConfig) -> Result<(), String> {
+fn save_config(mut cfg: FlashSafeConfig) -> Result<(), String> {
+    cfg.clamp();
     config::save_json(&cfg).map_err(|e| e.to_string())
 }
 
@@ -163,33 +170,33 @@ fn get_engine_stats() -> EngineStats {
     EngineStats::default()
 }
 
+/// `%APPDATA%\FlashSafe` — settings and logs.
+pub(crate) fn app_dir() -> std::path::PathBuf {
+    std::env::var("APPDATA")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("FlashSafe")
+}
+
 mod config {
     use anyhow::Result;
     use flashsafe_core::FlashSafeConfig;
     use std::path::PathBuf;
 
     fn path() -> Result<PathBuf> {
-        let dir = dirs_next();
+        let dir = crate::app_dir();
         std::fs::create_dir_all(&dir)?;
         Ok(dir.join("settings.json"))
     }
 
-    fn dirs_next() -> PathBuf {
-        std::env::var("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("FlashSafe")
-    }
-
+    /// Loads and migrates settings; a missing or corrupt file yields defaults.
     pub fn load_json() -> Result<FlashSafeConfig> {
         let p = path()?;
         if !p.exists() {
             return Ok(FlashSafeConfig::default());
         }
         let s = std::fs::read_to_string(&p)?;
-        let mut c: FlashSafeConfig = serde_json::from_str(&s)?;
-        c.clamp();
-        Ok(c)
+        Ok(FlashSafeConfig::from_json(&s))
     }
 
     pub fn save_json(cfg: &FlashSafeConfig) -> Result<()> {
@@ -202,10 +209,13 @@ mod config {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _log_guard = logging::init()
+        .map_err(|e| eprintln!("logging disabled: {e:#}"))
+        .ok();
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "FlashSafe starting");
     #[cfg(windows)]
     {
         tauri::Builder::default()
-            .plugin(tauri_plugin_shell::init())
             .manage(AppState {
                 engine: Arc::new(RwLock::new(None)),
                 config: Arc::new(RwLock::new(FlashSafeConfig::default())),

@@ -3,11 +3,9 @@ name = "flashsafe-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Flash detection, mitigation parameters, and frame metrics for FlashSafe"
+description = "Flash detection and mitigation filter for FlashSafe"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-
-[dev-dependencies]
 serde_json = "1"
+

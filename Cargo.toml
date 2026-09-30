@@ -6,3 +6,7 @@ members = ["crates/flashsafe-core", "src-tauri"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+
+# The filter's test suite runs thousands of simulated frames; keep it fast in debug.
+[profile.dev.package.flashsafe-core]
+opt-level = 2

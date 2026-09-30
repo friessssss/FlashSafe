@@ -158,3 +158,24 @@ button.secondary {
   font-size: 0.9rem;
   min-height: 1.2em;
 }
+.advanced {
+  margin-top: 0.75rem;
+}
+.advanced summary {
+  cursor: pointer;
+  color: #a8b4c8;
+  font-size: 0.9rem;
+}
+.field .val {
+  color: #7d8a9e;
+  font-variant-numeric: tabular-nums;
+  margin-left: 0.35rem;
+}
+#stat-state.on {
+  color: #6fd39a;
+}
+.disclaimer {
+  font-size: 0.78rem;
+  color: #6d788b;
+  margin-top: 1.25rem;
+}
