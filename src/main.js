@@ -9,11 +9,14 @@ const ADVANCED = [
     "How fast the picture may get brighter (fraction of full brightness per second). Lower = flashes are ramped in more slowly.",
     0.05, 3, 0.05],
   ["hold-rise", "holdRisePerSec", "Brightening speed during strobes",
-    "The same limit, used while a strobe or flicker is detected. Keep this low.",
+    "The brightening limit used while a strobe or flicker is detected. Keep this low.",
     0.02, 1, 0.01],
+  ["fall", "fallPerSec", "Darkening speed",
+    "How fast the picture may get darker. Lower = sudden cuts to dark become gentler fades.",
+    0.2, 10, 0.1],
   ["trigger", "strobeTrigger", "Strobe trigger",
     "How many quick back-and-forth brightness changes it takes to count as strobing. Lower = strobe mode engages sooner.",
-    1, 5, 0.1],
+    1, 6, 0.1],
   ["hold", "holdSecs", "Strobe hold (s)",
     "How long strobe mode stays on after the flicker stops.",
     0, 6, 0.1],
@@ -72,8 +75,9 @@ function showFilter(f) {
   }
 }
 
-function readFilter() {
-  const f = {};
+// Sliders override `base`, so settings without a slider are kept.
+function readFilter(base) {
+  const f = { ...base };
   for (const [id, key] of ADVANCED) {
     f[key] = key === "regionRadius" ? parseInt(el(id).value, 10) : parseFloat(el(id).value);
   }
@@ -142,7 +146,7 @@ async function main() {
     targetHwnd: parseInt(el("win-select").value, 10) || 0,
     targetTitle: el("win-select").selectedOptions[0]?.text?.split(" (PID")[0] || "",
     sensitivityPreset: document.querySelector(".preset-btn.active")?.dataset.preset || "custom",
-    filter: readFilter(),
+    filter: readFilter(cfg.filter),
   });
 
   // Push every change to the running engine and persist it.
@@ -167,6 +171,7 @@ async function main() {
     btn.addEventListener("click", () => {
       const name = btn.dataset.preset;
       if (name === "custom" || !presets[name]) return;
+      cfg = { ...cfg, filter: presets[name] };
       showFilter(presets[name]);
       setPresetButtons(name);
       apply();

@@ -24,7 +24,9 @@ impl Preset {
             Preset::Low => FilterParams {
                 rise_per_sec: 1.5,
                 hold_rise_per_sec: 0.3,
-                strobe_trigger: 2.5,
+                fall_per_sec: 5.0,
+                hold_fall_per_sec: 1.0,
+                strobe_trigger: 3.5,
                 hold_secs: 1.0,
                 min_gain: 0.05,
                 region_radius: 5,
@@ -34,7 +36,9 @@ impl Preset {
             Preset::High => FilterParams {
                 rise_per_sec: 0.4,
                 hold_rise_per_sec: 0.12,
-                strobe_trigger: 1.5,
+                fall_per_sec: 1.5,
+                hold_fall_per_sec: 0.3,
+                strobe_trigger: 2.5,
                 hold_secs: 2.5,
                 min_gain: 0.02,
                 region_radius: 4,
@@ -166,6 +170,7 @@ mod tests {
     fn presets_are_ordered_by_strength() {
         let p = sensitivity_presets();
         assert!(p.low.rise_per_sec > p.medium.rise_per_sec && p.medium.rise_per_sec > p.high.rise_per_sec);
+        assert!(p.low.fall_per_sec > p.medium.fall_per_sec && p.medium.fall_per_sec > p.high.fall_per_sec);
         assert!(p.low.min_gain >= p.medium.min_gain && p.medium.min_gain >= p.high.min_gain);
     }
 }
