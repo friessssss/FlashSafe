@@ -10,10 +10,11 @@ It's meant for single-player and casual co-op games. It uses compositor capture 
 
 ## How the filter works
 
-The screen is split into a 32×18 grid of tiles, measured in linear light (the units WCAG's flash rules use).
-- The displayed brightness of a tile may *drop* instantly, but it may only *rise* at a limited rate.
-- That rise is budgeted per screen area about the size of your central field of view. A small bright object moving around isn't dimmed, but a flash covering a real part of the screen is.
-- When back-and-forth flicker is detected, that area switches to a much slower rise rate for a few seconds, so a strobe becomes a steady, dim image.
+FlashSafe remembers what was on screen last frame, pixel by pixel, in linear light (the units WCAG's flash rules use).
+- A pixel may get brighter or darker only at a limited rate. That rate is budgeted per screen area about the size of your central field of view.
+- Small or moving details (a bright object, a panning texture) pass through untouched. A flash or cut that brightens or darkens a real part of the screen is turned into a short fade.
+- Pixels that aren't changing, such as a HUD or a menu bar, are never touched. Flashing pixels right next to them are still limited.
+- When back-and-forth flicker is detected, that area switches to much slower rates for a few seconds, so a strobe becomes a steady, dim image.
 
 The test suite scores the filtered output with a WCAG "three flashes per second" judge. It covers every preset, 30/60/144 fps and jittered frame timing.
 

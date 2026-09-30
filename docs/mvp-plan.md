@@ -2,8 +2,12 @@
 
 ## Status
 - **Phase 0 — done:** CI restored, real icons, generated schemas ignored, file logging, shell plugin dropped, CSP set, README rewritten.
-- **Phase 1 — done** except the `flashsafe-sim` PNG-sequence tool: WCAG judge, tile stats, filter, presets and config migration. 26 tests.
-- **Interim engine:** the existing mirror now runs the new filter. It uses CPU tiles, uploads a gain texture, applies the gain in linear light in the shader, takes only the newest frame, re-presents until settled, and turns cursor capture and the capture border off. It still uses the old HWND mirror window, so **mouse and focus pass-through is not fixed until Phase 2.**
+- **Phase 1 — done** except the `flashsafe-sim` PNG-sequence tool: WCAG judge, per-pixel filter with area budgets, presets and config migration. 33 tests.
+- **Interim engine:** the existing mirror runs the new filter.
+  - The GPU does the per-pixel work: a stats pass, then a mip-chain area average, then an apply pass that keeps a display history.
+  - The CPU runs the tile and region budget on a 160×90 readback.
+  - Only the target's **client area** is captured and covered (crop via `DWMWA_EXTENDED_FRAME_BOUNDS`), and the frame pool is recreated when the window is resized. These pieces were pulled forward from Phases 2 and 3.
+  - It still uses the old HWND mirror window, so **mouse and focus pass-through is not fixed until Phase 2.**
 - **Phases 2–6:** not started. They need a Windows machine to validate.
 
 ## Context
@@ -102,20 +106,31 @@ Game HWND ──WGC (cursor off, border off, free-threaded pool, newest-frame-on
   - When the frame `ContentSize` changes, call `FramePool.Recreate` and `ResizeBuffers`.
 - Capture session settings: `IsCursorCaptureEnabled(false)` so the real hardware cursor stays on top, and `IsBorderRequired(false)` on Win11, requesting `GraphicsCaptureAccess` when needed.
 
-### Filter algorithm: "luminance rise limiter + area budget + strobe hold" (implemented in Phase 1)
-All math runs in linear light using WCAG relative luminance, on a 32×18 tile grid (area-averaged). The design below replaced the first draft ("scale a region's gain"): tests showed that version made static content next to a strobe pump in and out, so the filter itself created flicker.
-- **Per tile:** the displayed luminance `S` may fall to the input instantly, but may only *rise* toward it. Tiles that aren't brightening are never touched.
-- **Per region:** rises are budgeted with a token bucket. A region is a full-size window about as big as WCAG's 10° field (11×7 tiles), shifted inward at the screen edges.
-  - Over any interval `T`, a region's displayed average may rise by at most `rate·(T + burst_secs)`.
-  - Each region scales the rises inside it to fit its budget.
-  - Each tile takes the strictest scale of any window covering it, so the bound holds for *every* region-sized window.
-  - A small bright object moving over a dark scene fits inside the burst allowance and passes untouched.
-- **Strobe hold:** a hysteresis tracker counts opposing transitions in each region's input. When decaying activity crosses `strobe_trigger`, that region's rate drops to `hold_rise_per_sec` until `hold_secs` after the strobing stops.
-- **Output:** `gain = S / L_in` (clamped to `[min_gain ≤ 0.06, 1]`) multiplies linear RGB, interpolated bilinearly between tile centres. The image is never brightened. The floor is capped because a floor near 0.1 lets a WCAG-sized jump through on its own.
-- **Presets** Low/Medium/High set `rise_per_sec`, `hold_rise_per_sec`, `strobe_trigger`, `hold_secs`, `min_gain`, `region_radius` and `burst_secs`. The UI shows presets, with Advanced settings in a disclosure.
-- **Test-backed guarantee** (in `crates/flashsafe-core/src/filter.rs`): for every preset, at 30/60/144 fps with jittered frame times, full-screen, localized, dark-on-bright and red strobes all score ≤ 3 flashes/s with the WCAG judge in `wcag.rs`. A bright object sweeping the screen during a fade is never dimmed below 0.85.
-- **Not yet:** a dedicated red-flash (saturated red ↔ other hue at equal luminance) term. Red strobes against dark are already caught through luminance.
-- **The engine must keep re-presenting** the last frame while `TileFilter::is_settled()` is false. Otherwise a scene that turns bright and then stops changing would stay dim, because WGC only delivers frames when the content changes.
+### Filter algorithm: per-pixel rise/fall limiter with area budgets and strobe hold
+All math runs in linear light using WCAG relative luminance.
+- **Per pixel, state = the colour displayed last frame** (`C`, luminance `P`). For input `x` with luminance `L`:
+  - **Brightening** (`L > P`): show `x` dimmed to `P + s_rise·(L − P)`.
+  - **Darkening:** crossfade `lerp(C, x, s_fall)`. A gain can't hold a pixel brighter than a frame that went black, so a crossfade is needed here.
+  - Pixels that aren't changing are never touched.
+- **Per tile (32×18), the *net* change `L_tile − P_tile` is budgeted.** A detailed texture panning across the screen changes many pixels but nets out to about zero, so it passes. A flash is a coherent net change.
+  - Only one side is limited per tile, so the displayed tile mean lands exactly on the allowed value.
+  - Per-pixel detail only decides *which* pixels absorb the limit.
+- **Per region** (a full-size window as big as WCAG's 10° field, 11×7 tiles, shifted inward at screen edges): two token buckets bound the displayed average. It may rise at most `rise·(T + burst_secs)` and fall at most `fall·(T + burst_secs)`. Each tile takes the strictest scale of any covering window, so the bound holds for every region-sized window.
+- **Strobe hold:** hysteresis-counted opposing transitions in a region's input switch it to slow `hold_rise`/`hold_fall` rates until `hold_secs` after the strobing stops. The triggers are set so that a single flash doesn't trigger hold.
+- **Interpolation:** per-tile scales are interpolated bilinearly per pixel. First, rise scales are eroded (3×3 min) and fall scales dilated (3×3 max, ignoring tiles with no darkening). That way no pixel is limited less strictly than its own tile requires.
+- **Gain floor:** `min_gain ≤ 0.06` on brightening pixels. A floor near 0.1 would let a WCAG-sized jump through on its own.
+- **Why per-pixel (history).** The first per-tile-gain version left a bright bar under the harness title bar. The title bar and the flashing pixels shared a tile, so the flash there was under-protected by about 0.22 luminance, and interpolation spread it. Bright HUD elements next to flashes in real games hit the same problem.
+- **Why falls are limited too.** With instant darkening, a single black frame in a bright scene became a drop followed by a ~1 s ramp back up, which is worse than the blip itself. It's now a shallow dip that recovers in about 8 frames, and cuts to black become short fades.
+- **Tests** (`crates/flashsafe-core/src/filter.rs`, through `PixelFilter`):
+  - Strobe cases, each ≤ 3 flashes/s by the WCAG judge in `wcag.rs`:
+    - full-screen, localized, dark-on-bright and red strobes;
+    - every preset, at 30/60/144 fps, with jittered frame times.
+  - Title-bar band and HUD bar next to strobes: untouched, with no bright bar or halo.
+  - Textured pan: passes through with under 0.02 mean error.
+  - Moving bright and dark objects: not dimmed or smeared.
+  - Other cases: single dark frame, cut to black, camera flash, scene cut, hold engage/release, long frame gaps.
+- **Not yet:** a dedicated red-flash term (saturated red ↔ another hue at equal luminance). Red strobes against dark are already caught through luminance.
+- **The engine must keep re-presenting** the last frame while `TileFilter::is_settled()` is false, because WGC only delivers frames when content changes.
 
 ### Latency budget
 The target is about 1 frame plus DWM composition over the game's own latency. To get there:

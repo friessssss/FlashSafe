@@ -9,5 +9,5 @@ pub mod tiles;
 pub mod wcag;
 
 pub use config::{sensitivity_presets, FlashSafeConfig, Preset, SensitivityPresets, CONFIG_VERSION};
-pub use filter::{FilterParams, FilterSummary, TileFilter};
-pub use tiles::{tile_luminance_bgra, BgraFrame, TILE_COLS, TILE_ROWS};
+pub use filter::{apply_pixel, FilterParams, FilterSummary, PixelFilter, TileFilter};
+pub use tiles::{tile_luminance_bgra, tile_stats_f32x4, BgraFrame, TileStats, TILE_COLS, TILE_ROWS};

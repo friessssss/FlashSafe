@@ -1,3 +1,6 @@
+// FlashSafe per-pixel filter. Mirrors `flashsafe_core::filter::apply_pixel`;
+// see crates/flashsafe-core/src/filter.rs for the model.
+
 struct VSOut {
     float4 pos : SV_POSITION;
     float2 uv : TEXCOORD0;
@@ -11,12 +14,24 @@ VSOut VSMain(uint vid : SV_VertexID) {
     return o;
 }
 
+cbuffer Params : register(b0) {
+    float min_gain;
+    float stats_level;
+    float2 pad;
+};
+
+// t0: captured client area (BGRA8, sRGB-encoded values) — or the stats
+//     texture in PSDownsample.
+// t1: colour displayed last frame (linear RGB).
+// t2: per-tile (rise scale, fall scale), TILE_COLS x TILE_ROWS; the linear
+//     clamp sampler interpolates between tile centres, matching
+//     `flashsafe_core::filter::sample_tile`.
 Texture2D src : register(t0);
-// Per-tile gain from the FlashSafe filter (TILE_COLS x TILE_ROWS, R32_FLOAT).
-// The linear clamp sampler interpolates between tile centres, matching
-// `flashsafe_core::filter::sample_gain`.
-Texture2D<float> gains : register(t1);
+Texture2D hist : register(t1);
+Texture2D<float2> scales : register(t2);
 SamplerState samp : register(s0);
+
+static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
 
 float3 srgb_to_linear(float3 c) {
     return (c <= 0.04045) ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
@@ -26,17 +41,49 @@ float3 linear_to_srgb(float3 c) {
     return (c <= 0.0031308) ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
-// Downscale blit for the detection texture.
-float4 PSBlit(VSOut i) : SV_TARGET {
-    return src.Sample(samp, i.uv);
+float3 frame_linear(float4 pos) {
+    return srgb_to_linear(src.Load(int3(pos.xy, 0)).rgb);
 }
 
-// Mirror output: scale linear light by the tile gain (never brightens).
-float4 PSMain(VSOut i) : SV_TARGET {
-    float3 c = src.Sample(samp, i.uv).rgb;
-    float g = saturate(gains.Sample(samp, i.uv));
-    if (g < 0.999) {
-        c = linear_to_srgb(srgb_to_linear(c) * g);
+// Seed the display history with the current frame.
+float4 PSPrime(VSOut i) : SV_TARGET {
+    return float4(frame_linear(i.pos), 1.0);
+}
+
+// Per-pixel (L, P, max(0, L - P), max(0, P - L)); tile means come from the mip chain.
+float4 PSStats(VSOut i) : SV_TARGET {
+    float l = dot(frame_linear(i.pos), LUMA);
+    float p = dot(hist.Load(int3(i.pos.xy, 0)).rgb, LUMA);
+    return float4(l, p, max(0.0, l - p), max(0.0, p - l));
+}
+
+// Area-averaged downsample of the stats texture for CPU readback.
+float4 PSDownsample(VSOut i) : SV_TARGET {
+    return src.SampleLevel(samp, i.uv, stats_level);
+}
+
+struct ApplyOut {
+    float4 color : SV_TARGET0; // mirror swapchain (sRGB-encoded)
+    float4 hist : SV_TARGET1;  // next display history (linear)
+};
+
+ApplyOut PSMain(VSOut i) {
+    float3 x = frame_linear(i.pos);
+    float3 prev = hist.Load(int3(i.pos.xy, 0)).rgb;
+    float2 s = scales.Sample(samp, i.uv);
+    float l = dot(x, LUMA);
+    float p = dot(prev, LUMA);
+    float3 o;
+    if (l > p) {
+        // Brightening: the current picture, dimmed to the allowed luminance.
+        float shown = max(p + s.x * (l - p), min_gain * l);
+        o = x * (shown / l);
+    } else {
+        // Darkening: crossfade from what was on screen.
+        o = lerp(prev, x, s.y);
     }
-    return float4(c, 1.0);
+    ApplyOut r;
+    r.color = float4(linear_to_srgb(saturate(o)), 1.0);
+    r.hist = float4(o, 1.0);
+    return r;
 }
