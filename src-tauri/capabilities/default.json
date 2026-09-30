@@ -6,7 +6,6 @@
   "permissions": [
     "core:default",
     "core:window:allow-close",
-    "core:window:allow-show",
-    "shell:allow-open"
+    "core:window:allow-show"
   ]
 }

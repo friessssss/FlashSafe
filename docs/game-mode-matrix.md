@@ -1,6 +1,6 @@
 # FlashSafe — game display mode matrix
 
-The **mirror** window returns **`HTTRANSPARENT`** from **`WM_NCHITTEST`** so mouse goes to the window underneath; FlashSafe still presents the filtered image on that HWND. (We avoid `WS_EX_TRANSPARENT` here because it can interact badly with some DXGI flip swap chains.)
+> **Known issue:** the mirror currently returns `HTTRANSPARENT` from `WM_NCHITTEST`. That only forwards clicks to windows owned by the *same thread*, so clicks don't reach the game. The fix is a `WS_EX_LAYERED | WS_EX_TRANSPARENT` overlay presented through DirectComposition; see Phase 2 in [mvp-plan.md](mvp-plan.md).
 
 FlashSafe captures **what the Windows compositor shows** for a chosen window (Windows.Graphics.Capture), similar to Game Bar or desktop recorders. That implies clear limits for fullscreen behavior.
 
@@ -15,7 +15,7 @@ FlashSafe captures **what the Windows compositor shows** for a chosen window (Wi
 
 1. Build and run `flashsafe-harness` (see crate `flashsafe`, binary `flashsafe-harness`).
 2. In FlashSafe, pick the harness window and start protection.
-3. You should see the mirror follow the window and **reactive frames** increment when the harness flashes white.
+3. The mirror should follow the window. When the harness flashes white, the flash should fade in instead of popping, and **Flashes softened** should increase.
 
 ## Anti-cheat note
 

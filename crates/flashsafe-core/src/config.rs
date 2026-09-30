@@ -1,54 +1,65 @@
+//! Persisted settings, presets and migration.
+
 use serde::{Deserialize, Serialize};
 
-fn default_sensitivity_preset() -> String {
-    "medium".into()
+use crate::filter::FilterParams;
+
+/// Bump when the on-disk shape or meaning of settings changes.
+pub const CONFIG_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Preset {
+    Low,
+    #[default]
+    Medium,
+    High,
+    Custom,
 }
 
-/// Low / medium / high pipeline bundles for the sensitivity UI.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+impl Preset {
+    /// Filter parameters for a named preset (`Custom` → medium as a base).
+    pub fn params(self) -> FilterParams {
+        let mut p = match self {
+            Preset::Low => FilterParams {
+                rise_per_sec: 1.5,
+                hold_rise_per_sec: 0.3,
+                strobe_trigger: 2.5,
+                hold_secs: 1.0,
+                min_gain: 0.05,
+                region_radius: 5,
+                burst_secs: 0.05,
+            },
+            Preset::Medium | Preset::Custom => FilterParams::default(),
+            Preset::High => FilterParams {
+                rise_per_sec: 0.4,
+                hold_rise_per_sec: 0.12,
+                strobe_trigger: 1.5,
+                hold_secs: 2.5,
+                min_gain: 0.02,
+                region_radius: 4,
+                burst_secs: 0.06,
+            },
+        };
+        p.clamp();
+        p
+    }
+}
+
+/// All presets, for the UI.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SensitivityPresets {
-    pub low: PipelineSettings,
-    pub medium: PipelineSettings,
-    pub high: PipelineSettings,
+    pub low: FilterParams,
+    pub medium: FilterParams,
+    pub high: FilterParams,
 }
 
-/// Returns clamped preset pipelines (single source of truth for UI + saved config).
 pub fn sensitivity_presets() -> SensitivityPresets {
-    let mut low = PipelineSettings {
-        grid_size: 12,
-        spike_delta_threshold: 0.20,
-        peak_clip_cell_fraction: 0.50,
-        pattern_sensitivity: 0.22,
-        max_mitigation: 0.55,
-        attack_ms: 22.0,
-        release_ms: 130.0,
-        temporal_blend: 0.2,
-        highlight_knee: 0.86,
-        exposure_scale: 0.52,
-        desaturate_on_threat: 0.18,
-    };
-    let mut medium = PipelineSettings::default();
-    let mut high = PipelineSettings {
-        grid_size: 20,
-        spike_delta_threshold: 0.055,
-        peak_clip_cell_fraction: 0.18,
-        pattern_sensitivity: 0.72,
-        max_mitigation: 0.98,
-        attack_ms: 5.0,
-        release_ms: 320.0,
-        temporal_blend: 0.38,
-        highlight_knee: 0.68,
-        exposure_scale: 0.26,
-        desaturate_on_threat: 0.52,
-    };
-    low.clamp();
-    medium.clamp();
-    high.clamp();
     SensitivityPresets {
-        low,
-        medium,
-        high,
+        low: Preset::Low.params(),
+        medium: Preset::Medium.params(),
+        high: Preset::High.params(),
     }
 }
 
@@ -56,98 +67,105 @@ pub fn sensitivity_presets() -> SensitivityPresets {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct FlashSafeConfig {
+    pub config_version: u32,
+    /// When false the mirror shows the game unfiltered (troubleshooting only).
     pub enabled: bool,
     /// Last selected target window (HWND as u64). 0 = none.
     pub target_hwnd: u64,
     /// Human-readable title for display only.
     pub target_title: String,
-    pub monitor_all_screens: bool,
-    /// Extra compositor delay (ms) before presenting mirror — tiny safety margin.
-    pub present_delay_ms: u32,
-    /// UI preset last chosen: `low` | `medium` | `high` | `custom`.
-    #[serde(default = "default_sensitivity_preset")]
-    pub sensitivity_preset: String,
-    pub pipeline: PipelineSettings,
+    pub sensitivity_preset: Preset,
+    pub filter: FilterParams,
 }
 
 impl Default for FlashSafeConfig {
     fn default() -> Self {
         Self {
-            // When false, detection still runs but GPU dimming stays off (preview / troubleshooting).
+            config_version: CONFIG_VERSION,
             enabled: true,
             target_hwnd: 0,
             target_title: String::new(),
-            monitor_all_screens: false,
-            present_delay_ms: 0,
-            sensitivity_preset: default_sensitivity_preset(),
-            pipeline: PipelineSettings::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase")]
-pub struct PipelineSettings {
-    /// Rows/columns for downsampled grid stats (e.g. 16 → 256 cells).
-    pub grid_size: u32,
-    /// Minimum mean luminance jump (linear 0–1) in one frame to count toward spike.
-    pub spike_delta_threshold: f32,
-    /// Fraction of downsample cells near white (≥0.95 luma) to flag peak clip.
-    pub peak_clip_cell_fraction: f32,
-    /// Weight for band-pass (3–30 Hz) energy in combined threat score [0,1].
-    pub pattern_sensitivity: f32,
-    /// Max mitigation blend factor when threat = 1.
-    pub max_mitigation: f32,
-    /// Attack time constant (ms) — how fast mitigation ramps up.
-    pub attack_ms: f32,
-    /// Release time constant (ms) — how fast mitigation decays.
-    pub release_ms: f32,
-    /// Temporal blend with previous mitigated frame (0 = off, 1 = heavy).
-    pub temporal_blend: f32,
-    /// Highlight knee: compress linear values above this toward 1.0.
-    pub highlight_knee: f32,
-    /// Optional global exposure scale when mitigating (multiplier on linear RGB).
-    pub exposure_scale: f32,
-    pub desaturate_on_threat: f32,
-}
-
-impl Default for PipelineSettings {
-    fn default() -> Self {
-        Self {
-            grid_size: 16,
-            spike_delta_threshold: 0.12,
-            peak_clip_cell_fraction: 0.35,
-            pattern_sensitivity: 0.4,
-            max_mitigation: 0.9,
-            attack_ms: 8.0,
-            release_ms: 200.0,
-            temporal_blend: 0.28,
-            highlight_knee: 0.74,
-            exposure_scale: 0.34,
-            desaturate_on_threat: 0.38,
+            sensitivity_preset: Preset::Medium,
+            filter: Preset::Medium.params(),
         }
     }
 }
 
 impl FlashSafeConfig {
+    /// Parse saved JSON, migrating older files. Never fails on unknown or
+    /// legacy fields; unparseable input falls back to defaults.
+    pub fn from_json(s: &str) -> Self {
+        let raw: serde_json::Value = serde_json::from_str(s).unwrap_or(serde_json::Value::Null);
+        let version = raw.get("configVersion").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut cfg: FlashSafeConfig = serde_json::from_value(raw.clone()).unwrap_or_else(|_| {
+            // Salvage what we can from a partially incompatible file.
+            let mut c = FlashSafeConfig::default();
+            if let Some(h) = raw.get("targetHwnd").and_then(|v| v.as_u64()) {
+                c.target_hwnd = h;
+            }
+            if let Some(t) = raw.get("targetTitle").and_then(|v| v.as_str()) {
+                c.target_title = t.to_string();
+            }
+            c
+        });
+        if version < 2 {
+            // v1 stored the old threat-score pipeline; its values don't map
+            // onto the slew filter, so restart from the preset.
+            if cfg.sensitivity_preset == Preset::Custom {
+                cfg.sensitivity_preset = Preset::Medium;
+            }
+            cfg.filter = cfg.sensitivity_preset.params();
+        }
+        cfg.config_version = CONFIG_VERSION;
+        cfg.clamp();
+        cfg
+    }
+
     pub fn clamp(&mut self) {
-        self.present_delay_ms = self.present_delay_ms.min(50);
-        self.pipeline.clamp();
+        if self.sensitivity_preset != Preset::Custom {
+            self.filter = self.sensitivity_preset.params();
+        }
+        self.filter.clamp();
     }
 }
 
-impl PipelineSettings {
-    pub fn clamp(&mut self) {
-        self.grid_size = self.grid_size.clamp(4, 64);
-        self.spike_delta_threshold = self.spike_delta_threshold.clamp(0.02, 0.5);
-        self.peak_clip_cell_fraction = self.peak_clip_cell_fraction.clamp(0.05, 1.0);
-        self.pattern_sensitivity = self.pattern_sensitivity.clamp(0.0, 1.0);
-        self.max_mitigation = self.max_mitigation.clamp(0.0, 1.0);
-        self.attack_ms = self.attack_ms.clamp(1.0, 500.0);
-        self.release_ms = self.release_ms.clamp(10.0, 2000.0);
-        self.temporal_blend = self.temporal_blend.clamp(0.0, 0.95);
-        self.highlight_knee = self.highlight_knee.clamp(0.5, 0.99);
-        self.exposure_scale = self.exposure_scale.clamp(0.2, 1.0);
-        self.desaturate_on_threat = self.desaturate_on_threat.clamp(0.0, 1.0);
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip() {
+        let mut c = FlashSafeConfig {
+            sensitivity_preset: Preset::Custom,
+            ..Default::default()
+        };
+        c.filter.rise_per_sec = 1.1;
+        let s = serde_json::to_string(&c).unwrap();
+        assert_eq!(FlashSafeConfig::from_json(&s), c);
+    }
+
+    #[test]
+    fn migrates_v1_file() {
+        let v1 = r#"{"enabled":true,"targetHwnd":42,"targetTitle":"Game","monitorAllScreens":false,
+            "presentDelayMs":0,"sensitivityPreset":"high","pipeline":{"gridSize":16}}"#;
+        let c = FlashSafeConfig::from_json(v1);
+        assert_eq!(c.config_version, CONFIG_VERSION);
+        assert_eq!(c.target_hwnd, 42);
+        assert_eq!(c.sensitivity_preset, Preset::High);
+        assert_eq!(c.filter, Preset::High.params());
+    }
+
+    #[test]
+    fn garbage_falls_back_to_default() {
+        assert_eq!(FlashSafeConfig::from_json("not json"), FlashSafeConfig::default());
+        let odd = r#"{"targetHwnd":7,"sensitivityPreset":"extreme"}"#;
+        assert_eq!(FlashSafeConfig::from_json(odd).target_hwnd, 7);
+    }
+
+    #[test]
+    fn presets_are_ordered_by_strength() {
+        let p = sensitivity_presets();
+        assert!(p.low.rise_per_sec > p.medium.rise_per_sec && p.medium.rise_per_sec > p.high.rise_per_sec);
+        assert!(p.low.min_gain >= p.medium.min_gain && p.medium.min_gain >= p.high.min_gain);
     }
 }

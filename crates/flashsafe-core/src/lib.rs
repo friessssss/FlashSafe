@@ -1,12 +1,13 @@
-//! FlashSafe core: configuration, fast flash metrics, and mitigation parameters.
+//! FlashSafe core: colour math, tile statistics, the WCAG flash judge, the
+//! mitigation filter (CPU reference) and persisted configuration.
 //! Platform capture and GPU presentation live in the Tauri host crate.
 
 pub mod config;
-pub mod detection;
-pub mod mitigation;
+pub mod filter;
+pub mod luma;
+pub mod tiles;
+pub mod wcag;
 
-pub use config::{sensitivity_presets, FlashSafeConfig, PipelineSettings, SensitivityPresets};
-pub use detection::{
-    DownsampleStats, FastFlashDetector, FastFlashDetectorConfig, FlashMetrics,
-};
-pub use mitigation::MitigationParams;
+pub use config::{sensitivity_presets, FlashSafeConfig, Preset, SensitivityPresets, CONFIG_VERSION};
+pub use filter::{FilterParams, FilterSummary, TileFilter};
+pub use tiles::{tile_luminance_bgra, BgraFrame, TILE_COLS, TILE_ROWS};
