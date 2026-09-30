@@ -22,11 +22,11 @@ impl Preset {
     pub fn params(self) -> FilterParams {
         let mut p = match self {
             Preset::Low => FilterParams {
-                rise_per_sec: 1.5,
+                rise_per_sec: 3.0,
                 hold_rise_per_sec: 0.3,
-                fall_per_sec: 5.0,
+                fall_per_sec: 12.0,
                 hold_fall_per_sec: 1.0,
-                strobe_trigger: 3.5,
+                strobe_trigger: 3.0,
                 hold_secs: 1.0,
                 min_gain: 0.05,
                 region_radius: 5,
@@ -34,11 +34,11 @@ impl Preset {
             },
             Preset::Medium | Preset::Custom => FilterParams::default(),
             Preset::High => FilterParams {
-                rise_per_sec: 0.4,
+                rise_per_sec: 0.9,
                 hold_rise_per_sec: 0.12,
-                fall_per_sec: 1.5,
+                fall_per_sec: 4.0,
                 hold_fall_per_sec: 0.3,
-                strobe_trigger: 2.5,
+                strobe_trigger: 2.65,
                 hold_secs: 2.5,
                 min_gain: 0.02,
                 region_radius: 4,

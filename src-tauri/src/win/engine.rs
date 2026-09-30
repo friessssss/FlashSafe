@@ -463,7 +463,8 @@ impl Surfaces {
 struct ShaderParams {
     min_gain: f32,
     stats_level: f32,
-    _pad: [f32; 2],
+    fade_weight: f32,
+    _pad: f32,
 }
 
 struct ActiveSession {
@@ -754,14 +755,13 @@ impl ActiveSession {
 
     fn run_passes(&mut self, surf: &mut Surfaces, dt: f32) -> Result<()> {
         let (w, h) = (surf.width, surf.height);
-        let params = ShaderParams {
+        let mut params = ShaderParams {
             min_gain: self.filter.params().min_gain,
             stats_level: surf.stats_level,
-            _pad: [0.0; 2],
+            fade_weight: 0.0,
+            _pad: 0.0,
         };
-        unsafe {
-            self.ctx.UpdateSubresource(&self.cb, 0, None, (&params as *const ShaderParams).cast(), 0, 0);
-        }
+        self.upload_params(&params);
         let frame = Some(surf.frame_srv.clone());
 
         if !surf.primed {
@@ -801,7 +801,15 @@ impl ActiveSession {
             self.ctx.Unmap(&self.det_staging, 0);
         }
 
+        let was_holding = self.filter.summary().hold_fraction > 0.0;
         self.filter.update(&self.stats, dt);
+        let holding = self.filter.summary().hold_fraction > 0.0;
+        if holding != was_holding {
+            tracing::debug!(holding, "strobe hold changed");
+        }
+        // The crossfade weight comes from this frame's update.
+        params.fade_weight = if self.config.enabled { self.filter.fade_weight() } else { 0.0 };
+        self.upload_params(&params);
         if self.config.enabled {
             let (rise, fall) = (self.filter.rise_scales(), self.filter.fall_scales());
             for ((pair, r), f) in self.scales.as_chunks_mut::<2>().0.iter_mut().zip(rise).zip(fall) {
@@ -841,6 +849,12 @@ impl ActiveSession {
         self.overlay.present();
         self.last_present = Instant::now();
         Ok(())
+    }
+
+    fn upload_params(&self, params: &ShaderParams) {
+        unsafe {
+            self.ctx.UpdateSubresource(&self.cb, 0, None, (params as *const ShaderParams).cast(), 0, 0);
+        }
     }
 
     /// Full-screen triangle into `rtvs` reading `srvs` (t0, t1, ...).

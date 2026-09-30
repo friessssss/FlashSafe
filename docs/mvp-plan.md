@@ -2,7 +2,7 @@
 
 ## Status
 - **Phase 0 — done:** CI restored, real icons, generated schemas ignored, file logging, shell plugin dropped, CSP set, README rewritten.
-- **Phase 1 — done** except the `flashsafe-sim` PNG-sequence tool: WCAG judge, per-pixel filter with area budgets, presets and config migration. 33 tests.
+- **Phase 1 — done** except the `flashsafe-sim` PNG-sequence tool: WCAG judge, per-pixel filter with area budgets, presets and config migration. 35 tests.
 - **Engine:**
   - The GPU does the per-pixel work: a stats pass, then a mip-chain area average, then an apply pass that keeps a display history.
   - The CPU runs the tile and region budget on a 160×90 readback.
@@ -116,13 +116,13 @@ Game HWND ──WGC (cursor off, border off, free-threaded pool, newest-frame-on
 All math runs in linear light using WCAG relative luminance.
 - **Per pixel, state = the colour displayed last frame** (`C`, luminance `P`). For input `x` with luminance `L`:
   - **Brightening** (`L > P`): show `x` dimmed to `P + s_rise·(L − P)`.
-  - **Darkening:** crossfade `lerp(C, x, s_fall)`. A gain can't hold a pixel brighter than a frame that went black, so a crossfade is needed here.
+  - **Darkening:** show the *current* image held brighter by a gain (up to 3×) toward `P + s_fall·(L − P)`, so moving content never leaves trails. Only screen-wide fades (most tiles darkening coherently: a cut to black, a full-screen flash ending) crossfade from the previous frame, `lerp(C, x, s_fall)`. The first version crossfaded every darkening pixel, which showed as heavy motion smear in Big Walk.
   - Pixels that aren't changing are never touched.
 - **Per tile (32×18), the *net* change `L_tile − P_tile` is budgeted.** A detailed texture panning across the screen changes many pixels but nets out to about zero, so it passes. A flash is a coherent net change.
   - Only one side is limited per tile, so the displayed tile mean lands exactly on the allowed value.
   - Per-pixel detail only decides *which* pixels absorb the limit.
 - **Per region** (a full-size window as big as WCAG's 10° field, 11×7 tiles, shifted inward at screen edges): two token buckets bound the displayed average. It may rise at most `rise·(T + burst_secs)` and fall at most `fall·(T + burst_secs)`. Each tile takes the strictest scale of any covering window, so the bound holds for every region-sized window.
-- **Strobe hold:** hysteresis-counted opposing transitions in a region's input switch it to slow `hold_rise`/`hold_fall` rates until `hold_secs` after the strobing stops. The triggers are set so that a single flash doesn't trigger hold.
+- **Strobe hold:** hysteresis-counted opposing transitions (≥ 0.10, the WCAG size) in a region's input switch it to slow `hold_rise`/`hold_fall` rates until `hold_secs` after the strobing stops. Activity decays with τ = 0.5 s, so it settles near 2.5 for a 2 Hz head bob and ≥ 3.5 for ≥ 3 Hz strobes; the triggers (2.65–3.0) sit between. Normal-mode rates are fast (Medium: rise 1.6/s, fall 8/s): a single transition isn't a flash, and strobes are handled by hold.
 - **Interpolation:** per-tile scales are interpolated bilinearly per pixel. First, rise scales are eroded (3×3 min) and fall scales dilated (3×3 max, ignoring tiles with no darkening). That way no pixel is limited less strictly than its own tile requires.
 - **Gain floor:** `min_gain ≤ 0.06` on brightening pixels. A floor near 0.1 would let a WCAG-sized jump through on its own.
 - **Why per-pixel (history).** The first per-tile-gain version left a bright bar under the harness title bar. The title bar and the flashing pixels shared a tile, so the flash there was under-protected by about 0.22 luminance, and interpolation spread it. Bright HUD elements next to flashes in real games hit the same problem.
@@ -132,6 +132,7 @@ All math runs in linear light using WCAG relative luminance.
     - full-screen, localized, dark-on-bright and red strobes;
     - every preset, at 30/60/144 fps, with jittered frame times.
   - Title-bar band and HUD bar next to strobes: untouched, with no bright bar or halo.
+  - Camera turns across a sky/ground horizon: no ghosting (output colour always matches the current frame). Walking head bob: no strobe hold, no noticeable dimming.
   - Textured pan: passes through with under 0.02 mean error.
   - Moving bright and dark objects: not dimmed or smeared.
   - Other cases: single dark frame, cut to black, camera flash, scene cut, hold engage/release, long frame gaps.

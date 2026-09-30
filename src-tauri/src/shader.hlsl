@@ -17,8 +17,12 @@ VSOut VSMain(uint vid : SV_VertexID) {
 cbuffer Params : register(b0) {
     float min_gain;
     float stats_level;
-    float2 pad;
+    float fade_weight; // 0 = hold current image brighter, 1 = crossfade (screen-wide fades)
+    float pad;
 };
+
+// Mirrors flashsafe_core::filter::MAX_FALL_GAIN.
+static const float MAX_FALL_GAIN = 3.0;
 
 // t0: captured client area (BGRA8, sRGB-encoded values) — or the stats
 //     texture in PSDownsample.
@@ -79,8 +83,15 @@ ApplyOut PSMain(VSOut i) {
         float shown = max(p + s.x * (l - p), min_gain * l);
         o = x * (shown / l);
     } else {
-        // Darkening: crossfade from what was on screen.
-        o = lerp(prev, x, s.y);
+        // Darkening: keep the current image, held brighter by a gain, so
+        // moving content never leaves trails of the previous frame. Only
+        // screen-wide fades crossfade from what was on screen.
+        float target = p + s.y * (l - p);
+        float max_c = max(x.r, max(x.g, x.b));
+        float g = l > 1e-5 ? max(min(min(target / l, MAX_FALL_GAIN), 1.0 / max(max_c, 1e-5)), 1.0) : 1.0;
+        float3 held = x * g;
+        float3 faded = lerp(prev, x, s.y);
+        o = lerp(held, faded, fade_weight);
     }
     ApplyOut r;
     r.color = float4(linear_to_srgb(saturate(o)), 1.0);

@@ -53,10 +53,24 @@ use crate::wcag::TransitionTracker;
 /// Longest frame gap the filter integrates over. Larger gaps (the game stopped
 /// presenting) would otherwise allow one big jump in a single displayed frame.
 pub const MAX_DT: f32 = 1.0 / 30.0;
-/// Time constant (s) of the strobe activity decay.
-pub const ACTIVITY_TAU: f32 = 1.0;
-/// Transition size (linear luminance) that counts toward strobe activity.
-pub const ACTIVITY_THRESHOLD: f32 = 0.08;
+/// Time constant (s) of the strobe activity decay. With transitions every
+/// `T` seconds, activity settles at `1 / (1 − e^(−T/τ))`: ≈2.5 for a 2 Hz
+/// head bob (4 transitions/s), ≈3.5 for a 3 Hz strobe and higher for faster
+/// ones — so the presets' triggers (2.65–3.0) separate the two.
+pub const ACTIVITY_TAU: f32 = 0.5;
+/// Transition size (linear luminance) that counts toward strobe activity:
+/// the WCAG transition size, so ordinary small oscillations don't count.
+pub const ACTIVITY_THRESHOLD: f32 = 0.10;
+/// Most a darkening pixel's current colour may be brightened to hold the
+/// allowed luminance. Beyond this (near-black) the pixel just falls, which
+/// can't cause a flash — a flash needs a rise.
+pub const MAX_FALL_GAIN: f32 = 3.0;
+/// A tile counts as fading when its net darkening exceeds this…
+const FADE_MIN_FALL: f32 = 0.01;
+/// …and is at least this share of its pixels' darkening (not motion).
+const FADE_COHERENCE: f32 = 0.7;
+/// Share of fading tiles over which crossfading ramps from off to fully on.
+const FADE_FRACTION: (f32, f32) = (0.5, 0.85);
 /// Remaining per-tile change below which the display counts as caught up.
 pub const SETTLE_EPS: f32 = 1e-3;
 /// BT.709 / WCAG luminance weights for linear RGB.
@@ -92,9 +106,9 @@ pub struct FilterParams {
 impl Default for FilterParams {
     fn default() -> Self {
         Self {
-            rise_per_sec: 0.8,
+            rise_per_sec: 1.6,
             hold_rise_per_sec: 0.2,
-            fall_per_sec: 2.5,
+            fall_per_sec: 8.0,
             hold_fall_per_sec: 0.5,
             strobe_trigger: 2.8,
             hold_secs: 1.5,
@@ -172,6 +186,7 @@ pub struct TileFilter {
     scratch: Vec<f32>,
     rise_scale: Vec<f32>,
     fall_scale: Vec<f32>,
+    fade_weight: f32,
     initialized: bool,
     settled: bool,
     in_event: bool,
@@ -213,6 +228,7 @@ impl TileFilter {
             scratch: vec![0.0; n],
             rise_scale: vec![1.0; n],
             fall_scale: vec![1.0; n],
+            fade_weight: 0.0,
             initialized: false,
             settled: true,
             in_event: false,
@@ -313,6 +329,7 @@ impl TileFilter {
         // lands exactly on the allowed value.
         let mut sum_gain = 0.0;
         let mut min_gain = 1.0f32;
+        let mut fading = 0usize;
         for (i, s) in stats.iter().enumerate() {
             if s.luma >= s.shown {
                 let allowed = self.cov_rise[i] * self.net_rise[i];
@@ -328,6 +345,9 @@ impl TileFilter {
                 let allowed = self.cov_fall[i] * self.net_fall[i];
                 self.tile_rise[i] = 1.0;
                 self.tile_fall[i] = if s.fall > EPS { ((s.rise + allowed) / s.fall).min(1.0) } else { 1.0 };
+                if self.net_fall[i] > FADE_MIN_FALL && self.net_fall[i] > FADE_COHERENCE * s.fall {
+                    fading += 1;
+                }
                 self.spent_rise[i] = 0.0;
                 self.spent_fall[i] = allowed;
                 sum_gain += 1.0;
@@ -340,6 +360,13 @@ impl TileFilter {
                 *v = 1.0;
             }
         }
+        // Crossfade from the previous frame only when most of the screen is
+        // darkening together (a cut to black, a full-screen flash ending). A
+        // camera turn only darkens tiles along a moving edge; crossfading
+        // there would leave ghost trails.
+        let frac = fading as f32 / stats.len().max(1) as f32;
+        let t = ((frac - FADE_FRACTION.0) / (FADE_FRACTION.1 - FADE_FRACTION.0)).clamp(0.0, 1.0);
+        self.fade_weight = t * t * (3.0 - 2.0 * t);
 
         // Spend what each region actually let through.
         box_blur(&self.spent_rise, &mut self.region_rise, &mut self.scratch, c, r, rx, ry);
@@ -368,9 +395,15 @@ impl TileFilter {
         &self.rise_scale
     }
 
-    /// Per-tile crossfade factor for darkening pixels, ready for bilinear sampling.
+    /// Per-tile fall scale for darkening pixels, ready for bilinear sampling.
     pub fn fall_scales(&self) -> &[f32] {
         &self.fall_scale
+    }
+
+    /// How much darkening pixels crossfade from the previous frame this
+    /// frame (0 = hold the current image brighter, 1 = full crossfade).
+    pub fn fade_weight(&self) -> f32 {
+        self.fade_weight
     }
 
     pub fn summary(&self) -> FilterSummary {
@@ -401,8 +434,21 @@ pub fn luminance(c: [f32; 3]) -> f32 {
 
 /// The per-pixel step, shared with the GPU shader. `x` is this frame's
 /// linear colour, `prev` the colour displayed last frame.
+///
+/// Brightening pixels show the current colour dimmed. Darkening pixels also
+/// show the current colour, held brighter by a gain, so moving content never
+/// leaves trails of the previous frame. Only screen-wide fades (`fade_weight`
+/// near 1: a cut to black, a full-screen flash ending) crossfade from the
+/// previous frame instead.
 #[inline]
-pub fn apply_pixel(x: [f32; 3], prev: [f32; 3], rise_scale: f32, fall_scale: f32, min_gain: f32) -> [f32; 3] {
+pub fn apply_pixel(
+    x: [f32; 3],
+    prev: [f32; 3],
+    rise_scale: f32,
+    fall_scale: f32,
+    fade_weight: f32,
+    min_gain: f32,
+) -> [f32; 3] {
     let l = luminance(x);
     let p = luminance(prev);
     if l > p {
@@ -410,12 +456,21 @@ pub fn apply_pixel(x: [f32; 3], prev: [f32; 3], rise_scale: f32, fall_scale: f32
         let k = shown / l;
         [x[0] * k, x[1] * k, x[2] * k]
     } else {
-        let t = fall_scale;
-        [
-            prev[0] + (x[0] - prev[0]) * t,
-            prev[1] + (x[1] - prev[1]) * t,
-            prev[2] + (x[2] - prev[2]) * t,
-        ]
+        let target = p + fall_scale * (l - p);
+        let max_c = x[0].max(x[1]).max(x[2]);
+        let g = if l > EPS {
+            (target / l).min(MAX_FALL_GAIN).min(1.0 / max_c.max(EPS)).max(1.0)
+        } else {
+            1.0
+        };
+        let w = fade_weight;
+        let mut o = [0.0; 3];
+        for k in 0..3 {
+            let held = x[k] * g;
+            let faded = prev[k] + (x[k] - prev[k]) * fall_scale;
+            o[k] = held + (faded - held) * w;
+        }
+        o
     }
 }
 
@@ -463,12 +518,13 @@ impl PixelFilter {
         tile_stats_f32x4(&self.stats_img, w * 4, w, h, TILE_COLS, TILE_ROWS, &mut self.stats);
         self.tiles.update(&self.stats, dt);
         let min_gain = self.tiles.params().min_gain;
+        let fade = self.tiles.fade_weight();
         for y in 0..h {
             for x in 0..w {
                 let i = y * w + x;
                 let sr = sample_tile(self.tiles.rise_scales(), TILE_COLS, TILE_ROWS, x, y, w, h);
                 let sf = sample_tile(self.tiles.fall_scales(), TILE_COLS, TILE_ROWS, x, y, w, h);
-                self.prev[i] = apply_pixel(input[i], self.prev[i], sr, sf, min_gain);
+                self.prev[i] = apply_pixel(input[i], self.prev[i], sr, sf, fade, min_gain);
             }
         }
         &self.prev
@@ -826,6 +882,89 @@ mod tests {
         assert!(worst_err < 0.02, "pan distorted by {worst_err} on average");
     }
 
+    /// A textured sky/ground scene whose horizon sits at `horizon` pixels.
+    /// Texture is fixed to the world, so it moves with the horizon.
+    fn landscape(x: usize, y: usize, horizon: f64) -> [f32; 3] {
+        let wy = y as f64 - horizon;
+        let h = (x as u32).wrapping_mul(2_654_435_761) ^ ((wy.floor() as i64) as u32).wrapping_mul(40_503);
+        let tex = ((h ^ (h >> 15)) & 0xff) as f32 / 255.0;
+        if wy < 0.0 {
+            let k = 0.85 + 0.15 * tex;
+            [0.45 * k, 0.65 * k, 0.95 * k]
+        } else {
+            let k = 0.6 + 0.4 * tex;
+            [0.06 * k, 0.14 * k, 0.03 * k]
+        }
+    }
+
+    fn chroma(c: [f32; 3]) -> [f32; 3] {
+        let s = (c[0] + c[1] + c[2]).max(1e-6);
+        [c[0] / s, c[1] / s, c[2] / s]
+    }
+
+    /// Turning the camera between sky and ground must never draw the previous
+    /// frame into the current one (ghost trails): every output pixel keeps
+    /// the colour of its *current* input, only brightness may differ.
+    #[test]
+    fn camera_turn_leaves_no_ghost_trails() {
+        let (w, h) = (C * 4, R * 4);
+        for (name, p) in presets() {
+            let sim = Sim { w, h, secs: 1.6, ..Sim::new(p) };
+            let mut worst = 0.0f32;
+            sim.run(
+                |t, x, y| {
+                    // Horizon sweeps the full height in 0.4 s, down then up.
+                    let phase = (t / 0.4) % 2.0;
+                    let frac = if phase < 1.0 { phase } else { 2.0 - phase };
+                    landscape(x, y, frac * h as f64)
+                },
+                |_, input, out| {
+                    for (i, o) in input.iter().zip(out) {
+                        if luminance(*i) < 0.02 || luminance(*o) < 0.01 {
+                            continue;
+                        }
+                        let (ci, co) = (chroma(*i), chroma(*o));
+                        let d = (0..3).map(|k| (ci[k] - co[k]).abs()).fold(0.0, f32::max);
+                        worst = worst.max(d);
+                    }
+                },
+            );
+            assert!(worst < 0.03, "{name}: ghosting, chromaticity off by {worst}");
+        }
+    }
+
+    /// Walking head bob moves a bright horizon up and down (±5% of the
+    /// screen, 2 Hz). That is ordinary motion, not a strobe: no hold, no
+    /// noticeable dimming.
+    #[test]
+    fn head_bob_does_not_trigger_strobe_hold() {
+        let (w, h) = (C * 4, R * 4);
+        for (name, p) in presets() {
+            let mut pf = PixelFilter::new(p, w, h);
+            let mut input = vec![[0.0; 3]; w * h];
+            for i in 0..180 {
+                let t = i as f64 / 60.0;
+                let horizon = h as f64 * (0.5 + 0.05 * (t * 2.0 * std::f64::consts::TAU).sin());
+                for y in 0..h {
+                    for x in 0..w {
+                        input[y * w + x] = landscape(x, y, horizon);
+                    }
+                }
+                let out = pf.process(&input, 1.0 / 60.0).to_vec();
+                assert_eq!(pf.tiles().summary().hold_fraction, 0.0, "{name}: hold engaged at {t:.2}s");
+                if i < 6 {
+                    continue;
+                }
+                for (a, o) in input.iter().zip(&out) {
+                    let (li, lo) = (luminance(*a), luminance(*o));
+                    if li > 0.05 {
+                        assert!(lo >= li * 0.8, "{name} @ {t:.2}s: dimmed {li} → {lo}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn single_dark_frame_is_a_short_shallow_dip() {
         let p = FilterParams::default();
@@ -931,13 +1070,16 @@ mod tests {
     fn apply_pixel_preserves_hue_and_never_brightens() {
         let prev = [0.1, 0.1, 0.1];
         let x = [0.9, 0.3, 0.1];
-        let o = apply_pixel(x, prev, 0.25, 1.0, 0.0);
+        let o = apply_pixel(x, prev, 0.25, 1.0, 0.0, 0.0);
         assert!(luminance(o) < luminance(x));
         assert!((o[0] / o[1] - x[0] / x[1]).abs() < 1e-5, "hue changed");
-        assert_eq!(apply_pixel(x, prev, 1.0, 1.0, 0.0), x);
-        // Darkening crossfades from the previous output.
-        let o = apply_pixel([0.0; 3], [0.8; 3], 1.0, 0.25, 0.0);
+        assert_eq!(apply_pixel(x, prev, 1.0, 1.0, 0.0, 0.0), x);
+        // Coherent darkening crossfades from the previous output...
+        let o = apply_pixel([0.0; 3], [0.8; 3], 1.0, 0.25, 1.0, 0.0);
         assert!((o[0] - 0.6).abs() < 1e-6);
+        // ...motion darkening holds the current colour brighter instead.
+        let o = apply_pixel([0.1, 0.2, 0.3], [0.8; 3], 1.0, 0.25, 0.0, 0.0);
+        assert!((o[0] / o[1] - 0.5).abs() < 1e-5 && luminance(o) > luminance([0.1, 0.2, 0.3]));
     }
 
     #[test]
